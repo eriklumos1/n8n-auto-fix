@@ -54,13 +54,23 @@ async function getWorkflow(workflowId) {
 }
 
 async function updateWorkflow(workflowId, workflow) {
+  // n8n API only accepts specific fields -- strip everything else
+  const payload = {
+    name: workflow.name,
+    nodes: workflow.nodes,
+    connections: workflow.connections,
+    settings: workflow.settings,
+  };
+  if (workflow.staticData !== undefined) payload.staticData = workflow.staticData;
+  if (workflow.pinData !== undefined) payload.pinData = workflow.pinData;
+
   const res = await fetch(`${N8N_API_URL}/api/v1/workflows/${workflowId}`, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
       "X-N8N-API-KEY": N8N_API_KEY,
     },
-    body: JSON.stringify(workflow),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const text = await res.text();
