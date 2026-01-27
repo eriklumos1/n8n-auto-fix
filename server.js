@@ -53,16 +53,35 @@ async function getWorkflow(workflowId) {
   return res.json();
 }
 
+function cleanNode(node) {
+  // Only include properties the n8n API accepts for a node
+  const clean = {
+    id: node.id,
+    name: node.name,
+    type: node.type,
+    typeVersion: node.typeVersion,
+    position: node.position,
+    parameters: node.parameters || {},
+  };
+  if (node.credentials) clean.credentials = node.credentials;
+  if (node.disabled) clean.disabled = node.disabled;
+  if (node.onError) clean.onError = node.onError;
+  if (node.continueOnFail) clean.continueOnFail = node.continueOnFail;
+  if (node.retryOnFail) clean.retryOnFail = node.retryOnFail;
+  if (node.maxTries) clean.maxTries = node.maxTries;
+  if (node.waitBetweenTries) clean.waitBetweenTries = node.waitBetweenTries;
+  if (node.notes) clean.notes = node.notes;
+  if (node.executeOnce) clean.executeOnce = node.executeOnce;
+  return clean;
+}
+
 async function updateWorkflow(workflowId, workflow) {
-  // n8n API only accepts specific fields -- strip everything else
+  // n8n API is strict -- only send name, nodes, and connections
   const payload = {
     name: workflow.name,
-    nodes: workflow.nodes,
+    nodes: (workflow.nodes || []).map(cleanNode),
     connections: workflow.connections,
-    settings: workflow.settings,
   };
-  if (workflow.staticData !== undefined) payload.staticData = workflow.staticData;
-  if (workflow.pinData !== undefined) payload.pinData = workflow.pinData;
 
   const res = await fetch(`${N8N_API_URL}/api/v1/workflows/${workflowId}`, {
     method: "PUT",
