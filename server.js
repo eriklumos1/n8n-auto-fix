@@ -75,12 +75,26 @@ function cleanNode(node) {
   return clean;
 }
 
+function cleanSettings(settings) {
+  if (!settings) return {};
+  const allowed = [
+    "executionOrder", "timezone", "errorWorkflow",
+    "saveDataErrorExecution", "saveDataSuccessExecution",
+    "saveExecutionProgress", "saveManualExecutions", "executionTimeout",
+  ];
+  const clean = {};
+  for (const key of allowed) {
+    if (settings[key] !== undefined) clean[key] = settings[key];
+  }
+  return clean;
+}
+
 async function updateWorkflow(workflowId, workflow) {
-  // n8n API is strict -- only send name, nodes, and connections
   const payload = {
     name: workflow.name,
     nodes: (workflow.nodes || []).map(cleanNode),
     connections: workflow.connections,
+    settings: cleanSettings(workflow.settings),
   };
 
   const res = await fetch(`${N8N_API_URL}/api/v1/workflows/${workflowId}`, {
