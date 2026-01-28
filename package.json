@@ -1,12 +1,21 @@
 {
   "name": "n8n-auto-fix",
-  "version": "1.0.0",
-  "description": "Auto-fix server for n8n workflow errors",
+  "version": "2.0.0",
+  "description": "Intelligent auto-fix server for n8n workflow errors using Claude with tool use",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "n8n",
+    "automation",
+    "error-handling",
+    "claude",
+    "ai"
+  ],
+  "author": "Lumos",
+  "license": "MIT"
 }
