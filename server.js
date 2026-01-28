@@ -6,16 +6,19 @@ const http = require("http");
 
 const PORT = process.env.PORT || 10000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const N8N_API_URL = process.env.N8N_API_URL; // e.g., https://n8n-tlkm.onrender.com
+const N8N_API_URL = process.env.N8N_API_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SLACK_CHANNEL = "C09FEFUG5FT"; // #n8n-errors
+const SLACK_CHANNEL = "C09FEFUG5FT";
 
 // Never auto-fix the error workflow itself
 const ERROR_WORKFLOW_ID = "JtMGyvm5ub4nlDxe";
 
 // Cooldown to prevent repeated fix attempts
-const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const COOLDOWN_MS = 5 * 60 * 1000;
+
+// Use the most intelligent model
+const CLAUDE_MODEL = "claude-opus-4-5-20251101";
 
 // =============================================================================
 // STATE
@@ -30,13 +33,20 @@ function log(msg) {
 }
 
 // =============================================================================
-// TOOL DEFINITIONS FOR CLAUDE
+// TOOL DEFINITIONS
 // =============================================================================
 
 const TOOLS = [
   {
     name: "get_execution_details",
-    description: "Fetch detailed execution information including the error context, failed node configuration, and input data that caused the failure. This is essential for understanding what went wrong.",
+    description: `Fetch detailed execution information including error context, failed node configuration, input data, and execution path. This is ESSENTIAL - always call this first to understand what went wrong.
+
+Returns:
+- Error message and description
+- HTTP status code if applicable
+- Failed node name and full configuration
+- Upstream node data (what was fed into the failed node)
+- Execution path showing which nodes ran`,
     input_schema: {
       type: "object",
       properties: {
@@ -50,7 +60,7 @@ const TOOLS = [
   },
   {
     name: "get_workflow",
-    description: "Fetch the complete workflow structure including all nodes and connections.",
+    description: "Fetch the complete workflow structure including all nodes, their configurations, and connections.",
     input_schema: {
       type: "object",
       properties: {
@@ -64,7 +74,10 @@ const TOOLS = [
   },
   {
     name: "update_node",
-    description: "Update a specific node's parameters in the workflow. Only updates the specified node, leaving everything else unchanged.",
+    description: `Update a specific node's parameters in the workflow. Use this to fix node configurations.
+
+IMPORTANT: Only updates the specified node's parameters - all other nodes remain unchanged.
+The parameters object should be the COMPLETE new parameters for the node.`,
     input_schema: {
       type: "object",
       properties: {
@@ -85,8 +98,22 @@ const TOOLS = [
     }
   },
   {
+    name: "validate_workflow",
+    description: "Validate that a workflow can be loaded and executed by n8n. Call this AFTER making fixes to verify they work.",
+    input_schema: {
+      type: "object",
+      properties: {
+        workflow_id: {
+          type: "string",
+          description: "The workflow ID to validate"
+        }
+      },
+      required: ["workflow_id"]
+    }
+  },
+  {
     name: "send_slack_notification",
-    description: "Send a notification to the #n8n-errors Slack channel with the analysis results.",
+    description: "Send a notification to the #n8n-errors Slack channel. Use mrkdwn formatting.",
     input_schema: {
       type: "object",
       properties: {
@@ -100,7 +127,7 @@ const TOOLS = [
   },
   {
     name: "complete",
-    description: "Call this when you have finished analyzing and either fixed the error or determined it cannot be auto-fixed. This ends the session.",
+    description: "Call this when finished. Indicate whether the fix was successful and provide a summary.",
     input_schema: {
       type: "object",
       properties: {
@@ -119,92 +146,176 @@ const TOOLS = [
 ];
 
 // =============================================================================
-// SYSTEM PROMPT WITH EXPERT KNOWLEDGE
+// EXPERT KNOWLEDGE SYSTEM PROMPT
 // =============================================================================
 
-const SYSTEM_PROMPT = `You are an expert n8n workflow debugger with deep knowledge of n8n automation patterns. Your job is to analyze workflow errors and fix them when possible.
+const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.5, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
 
-## Your Capabilities
-You have access to tools that let you:
-1. Fetch execution details (including input data and error context)
-2. Get the full workflow configuration
-3. Update specific nodes to fix issues
-4. Send Slack notifications with your analysis
-
-## Debugging Process
+## Your Process
 1. ALWAYS start by calling get_execution_details to understand the full error context
-2. If needed, call get_workflow to see the complete workflow structure
-3. Analyze the error and determine if it's auto-fixable
-4. If fixable: use update_node to apply the fix, then send a success notification
-5. If not fixable: send a notification explaining why and what manual steps are needed
-6. ALWAYS call complete() when done
+2. Analyze the error type and determine if it's auto-fixable
+3. If fixable: Apply the fix using update_node, then validate with validate_workflow
+4. Send a Slack notification with results
+5. Call complete() when done
 
-## Auto-Fixable Errors (FIX THESE)
-- UNKNOWN_FIELD_NAME: Airtable field was renamed/deleted → Remove the field from the node's value mapping and schema
-- Expression syntax errors: Typos in $json references → Fix the expression
-- Missing resource/operation: Node missing required params → Add them
-- Wrong field mappings: Incorrect $json paths → Fix the path
-- Type mismatches: Can be fixed with type conversion
-- Empty record ID (INVALID_RECORDS): Usually an upstream data issue → Fix the IF condition or expression
+## Auto-Fixable Errors (YOU MUST FIX THESE)
 
-## NOT Auto-Fixable Errors (NOTIFY ONLY)
+### UNKNOWN_FIELD_NAME (Airtable)
+The field doesn't exist in Airtable. Fix by removing the field from BOTH:
+1. columns.value - Remove the key-value pair
+2. columns.schema - Remove the object with matching id
+
+Example fix for "Unknown field name: total_messages":
+- Remove from value: "total_messages": "={{ $json.fresh_total_messages }}"
+- Remove from schema: { "id": "total_messages", ... }
+
+### INVALID_RECORDS (Airtable)
+Usually means the record ID is empty/null. Common causes:
+- IF node passing empty data
+- Search node returning no results but alwaysOutputData: true
+- Expression referencing wrong node
+
+Fix: Check the IF condition or expression that provides the record ID.
+
+### Expression Errors
+- Wrong property path: Fix the $json reference
+- Referencing wrong node: Use $('Node Name').item.json.field
+- $json is empty: Previous node returned no data, reference source node directly
+
+### Missing resource/operation (Anthropic node)
+The Anthropic node REQUIRES both resource and operation:
+- Add: "resource": "text"
+- Add: "operation": "message"
+
+## NOT Auto-Fixable (Notify Only)
 - 401/403: Authentication/credential failures
 - 429/500/502/503: External API issues
 - Network connectivity problems
-- Missing external resources (deleted Airtable bases, etc.)
-- Permission/access denied
+- Missing external resources
+- Permission denied errors
 
-## Expert Knowledge: Lumos n8n Patterns
+## Lumos Expert Knowledge
 
-### Verified Working typeVersions (ALWAYS use these)
-- n8n-nodes-base.webhook: 2.1
-- n8n-nodes-base.httpRequest: 4.2
-- n8n-nodes-base.code: 2
-- n8n-nodes-base.set: 3.4
-- n8n-nodes-base.if: 2.2
-- n8n-nodes-base.filter: 2.2
-- n8n-nodes-base.slack: 2.2
-- n8n-nodes-base.airtable: 2.1
-- n8n-nodes-base.switch: 3.4
+### Verified Credentials (ALWAYS use these IDs)
+| Service | Credential ID | Name |
+|---------|--------------|------|
+| Slack | zxjXo2rPXuHjq0Ei | Lumos Slack |
+| Anthropic | tOV9sEG5g7qxBy3v | Lumos - Anthropic |
+| OpenAI | SGBYTOrjNKrLWMao | Lumos - OpenAI |
+| Airtable | nnp50zxomNRPb9PV | Airtable - Agentic |
 
-### Lumos Credentials (use these IDs)
-- Slack: { id: "zxjXo2rPXuHjq0Ei", name: "Lumos Slack" }
-- Anthropic: { id: "tOV9sEG5g7qxBy3v", name: "Lumos - Anthropic" }
-- OpenAI: { id: "SGBYTOrjNKrLWMao", name: "Lumos - OpenAI" }
-- Airtable: { id: "nnp50zxomNRPb9PV", name: "Airtable - Agentic" }
+### Verified typeVersions (MUST use these)
+| Node Type | Version |
+|-----------|---------|
+| n8n-nodes-base.webhook | 2.1 |
+| n8n-nodes-base.httpRequest | 4.2 |
+| n8n-nodes-base.code | 2 |
+| n8n-nodes-base.set | 3.4 |
+| n8n-nodes-base.if | 2.2 |
+| n8n-nodes-base.slack | 2.2 |
+| n8n-nodes-base.airtable | 2.1 |
+| n8n-nodes-base.switch | 3.4 |
+| @n8n/n8n-nodes-langchain.anthropic | 1 |
+| @n8n/n8n-nodes-langchain.openAi | 1.6 |
 
-### Common Airtable Fixes
-When you see UNKNOWN_FIELD_NAME for a field like "total_messages":
-1. Remove the field from columns.value (e.g., delete "total_messages": "={{ $json.fresh_total_messages }}")
-2. Remove the field from columns.schema array (find and remove the object with id: "total_messages")
+### Airtable Table IDs
+| Table | Base ID | Table ID |
+|-------|---------|----------|
+| LI Conversations | app5AMIkyZZ8OOygP | tblnh62jE0TLIICCY |
+| Content OS Base | appP3XYuyhYRTmEDv | - |
+| Content Ready Queue | appP3XYuyhYRTmEDv | tbl1xc0xmffTBvgFi |
+| Hook Library | appP3XYuyhYRTmEDv | tbl0jCr4oCQPqTELo |
 
-### Expression Data Flow Issues
-If error involves empty data or undefined fields:
-- Check if the previous node returns empty (IF nodes, search nodes with no results)
-- Use explicit node references: $('Node Name').item.json.field instead of $json.field
-- Check if alwaysOutputData is causing empty items to pass through
+### Expression Data Flow Rules
+CRITICAL: $json only contains data from the IMMEDIATELY PREVIOUS node.
+
+When to use $('Node Name').item.json.field:
+- Previous node is a lookup/search that may return empty
+- Previous node is an IF/Switch that doesn't carry forward data
+- Previous node transforms or filters data
+- Any time the field you need is NOT from immediate predecessor
+
+Common pattern after Airtable operations:
+- Airtable Update/Create ONLY returns the Airtable record
+- All upstream data is LOST
+- MUST reference source node: $('Original Node').item.json.field
+
+### IF Node with alwaysOutputData Issue
+If a search node has alwaysOutputData: true, it outputs an empty item even with no results.
+Checking array length will always be > 0.
+FIX: Check for actual data, not just item existence:
+- Wrong: $('Search Node').all().length > 0
+- Right: $('Search Node').first().json.id (check for actual field)
+
+### Airtable CRUD Notes
+- Operations are CAPITALIZED: "Delete", "Update", "Create"
+- Delete REQUIRES explicit id mapping: "id": "={{ $json.id }}"
+- Update uses matchingColumns: ["id"]
+- ALWAYS enable typecast: true in options
+
+### Switch Node v3.4 Structure
+- Use rules.values (NOT rules.rules)
+- Options need version: 3 (NOT version: 2)
+- Require looseTypeValidation: true at top level
+
+### Anthropic Node Requirements
+MUST have:
+- resource: "text"
+- operation: "message"
+- messages.values[].role: "user"
+- typeVersion: 1 (NOT 1.3)
+
+### Common Model IDs
+- Claude Opus 4.5: claude-opus-4-5-20251101
+- Claude Sonnet 4.5: claude-sonnet-4-5-20250929
+- GPT-5.2: gpt-5.2
 
 ## Guardrails
 - NEVER modify credentials or authentication settings
 - NEVER delete nodes from a workflow
-- NEVER change trigger configurations (webhooks, schedules)
-- NEVER modify the error monitoring workflow itself
-- Only fix the specific error, don't refactor or "improve" other parts
-- If uncertain, mark as not auto-fixable and explain why
+- NEVER change trigger configurations
+- NEVER modify the error monitoring workflow (ID: JtMGyvm5ub4nlDxe)
+- Only fix the specific error - don't refactor or "improve" other parts
+- If uncertain, mark as not auto-fixable
 
-## Response Style
-Be concise and specific. When sending Slack notifications:
-- Use emoji indicators: :white_check_mark: for fixed, :rotating_light: for action required
-- Include the specific fix applied or specific manual steps needed
-- Always include execution ID for reference`;
+## Slack Message Format
+
+For FIXED errors:
+\`:white_check_mark: *Auto-Fixed: {workflow_name}*
+
+*Error:* {error_message}
+*Failed Node:* {node_name}
+*Execution:* {execution_id}
+
+*Fix Applied:* {specific description of what was changed}
+*Validation:* Passed
+
+_Auto-fixed by Claude Opus 4.5 at {timestamp}_\`
+
+For NOT FIXABLE errors:
+\`:rotating_light: *Action Required: {workflow_name}*
+
+*Error:* {error_message}
+*Failed Node:* {node_name}
+*Execution:* {execution_id}
+
+*Why this can't be auto-fixed:* {explanation}
+
+*Suggested manual steps:*
+1. {step 1}
+2. {step 2}
+3. {step 3}
+
+_Analyzed by Claude Opus 4.5 at {timestamp}_\``;
 
 // =============================================================================
 // TOOL HANDLERS
 // =============================================================================
 
 async function handleGetExecutionDetails(executionId) {
-  const url = `${N8N_API_URL}/api/v1/executions/${executionId}?includeData=true`;
+  log(`Fetching execution ${executionId}...`);
 
+  const url = `${N8N_API_URL}/api/v1/executions/${executionId}?includeData=true`;
   const res = await fetch(url, {
     headers: { "X-N8N-API-KEY": N8N_API_KEY }
   });
@@ -216,46 +327,65 @@ async function handleGetExecutionDetails(executionId) {
 
   const execution = await res.json();
 
-  // Extract the most relevant information
+  // Build comprehensive result
   const result = {
     id: execution.id,
     workflowId: execution.workflowId,
+    workflowName: execution.workflowData?.name || "Unknown",
     status: execution.status,
-    mode: execution.mode,
     startedAt: execution.startedAt,
     stoppedAt: execution.stoppedAt,
     error: null,
     failedNode: null,
+    failedNodeType: null,
     failedNodeConfig: null,
-    inputData: null
+    upstreamData: {},
+    executionPath: []
   };
 
   // Extract error info
   if (execution.data?.resultData?.error) {
     const error = execution.data.resultData.error;
     result.error = {
-      message: error.message,
-      description: error.description,
-      httpCode: error.httpCode,
-      node: error.node?.name,
-      nodeType: error.node?.type
+      message: error.message || "Unknown error",
+      description: error.description || "",
+      httpCode: error.httpCode || "",
+      context: error.context || {}
     };
-    result.failedNode = error.node?.name;
-    result.failedNodeConfig = error.node;
+
+    if (error.node) {
+      result.failedNode = error.node.name;
+      result.failedNodeType = error.node.type;
+      result.failedNodeConfig = {
+        name: error.node.name,
+        type: error.node.type,
+        typeVersion: error.node.typeVersion,
+        parameters: error.node.parameters,
+        credentials: error.node.credentials
+      };
+    }
   }
 
-  // Try to find input data for the failed node
-  if (result.failedNode && execution.data?.resultData?.runData) {
+  // Extract execution path and upstream data
+  if (execution.data?.resultData?.runData) {
     const runData = execution.data.resultData.runData;
 
-    // Find the node that fed into the failed node
     for (const [nodeName, nodeRuns] of Object.entries(runData)) {
       if (nodeRuns && nodeRuns.length > 0) {
         const lastRun = nodeRuns[nodeRuns.length - 1];
+
+        // Add to execution path
+        result.executionPath.push({
+          node: nodeName,
+          success: !lastRun.error,
+          itemCount: lastRun.data?.main?.[0]?.length || 0
+        });
+
+        // Store sample data (first 2 items max)
         if (lastRun.data?.main?.[0]) {
-          // Store first few items as context
-          result.inputData = result.inputData || {};
-          result.inputData[nodeName] = lastRun.data.main[0].slice(0, 3);
+          result.upstreamData[nodeName] = lastRun.data.main[0]
+            .slice(0, 2)
+            .map(item => item.json);
         }
       }
     }
@@ -265,8 +395,9 @@ async function handleGetExecutionDetails(executionId) {
 }
 
 async function handleGetWorkflow(workflowId) {
-  const url = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
+  log(`Fetching workflow ${workflowId}...`);
 
+  const url = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
   const res = await fetch(url, {
     headers: { "X-N8N-API-KEY": N8N_API_KEY }
   });
@@ -278,7 +409,6 @@ async function handleGetWorkflow(workflowId) {
 
   const workflow = await res.json();
 
-  // Return a cleaned version focused on what's needed for debugging
   return {
     id: workflow.id,
     name: workflow.name,
@@ -290,14 +420,18 @@ async function handleGetWorkflow(workflowId) {
       typeVersion: n.typeVersion,
       parameters: n.parameters,
       credentials: n.credentials,
-      position: n.position
+      position: n.position,
+      disabled: n.disabled,
+      alwaysOutputData: n.alwaysOutputData
     })),
     connections: workflow.connections
   };
 }
 
 async function handleUpdateNode(workflowId, nodeName, newParameters) {
-  // First, fetch the current workflow
+  log(`Updating node "${nodeName}" in workflow ${workflowId}...`);
+
+  // Fetch current workflow
   const getUrl = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
   const getRes = await fetch(getUrl, {
     headers: { "X-N8N-API-KEY": N8N_API_KEY }
@@ -314,10 +448,7 @@ async function handleUpdateNode(workflowId, nodeName, newParameters) {
   const updatedNodes = workflow.nodes.map(node => {
     if (node.name === nodeName) {
       nodeFound = true;
-      return {
-        ...node,
-        parameters: newParameters
-      };
+      return { ...node, parameters: newParameters };
     }
     return node;
   });
@@ -364,8 +495,7 @@ async function handleUpdateNode(workflowId, nodeName, newParameters) {
   }
 
   // Update the workflow
-  const updateUrl = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
-  const updateRes = await fetch(updateUrl, {
+  const updateRes = await fetch(getUrl, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -384,10 +514,66 @@ async function handleUpdateNode(workflowId, nodeName, newParameters) {
     throw new Error(`Failed to update workflow: ${updateRes.status} - ${text}`);
   }
 
-  return { success: true, message: `Updated node "${nodeName}" in workflow "${workflow.name}"` };
+  return {
+    success: true,
+    message: `Updated node "${nodeName}" in workflow "${workflow.name}"`
+  };
+}
+
+async function handleValidateWorkflow(workflowId) {
+  log(`Validating workflow ${workflowId}...`);
+
+  // Try to fetch the workflow - if it loads without error, it's valid
+  const url = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
+  const res = await fetch(url, {
+    headers: { "X-N8N-API-KEY": N8N_API_KEY }
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    return {
+      valid: false,
+      error: `Workflow failed to load: ${text}`
+    };
+  }
+
+  const workflow = await res.json();
+
+  // Basic validation checks
+  const issues = [];
+
+  if (!workflow.nodes || workflow.nodes.length === 0) {
+    issues.push("Workflow has no nodes");
+  }
+
+  if (!workflow.connections || Object.keys(workflow.connections).length === 0) {
+    issues.push("Workflow has no connections");
+  }
+
+  // Check for nodes with missing required parameters
+  for (const node of workflow.nodes || []) {
+    if (node.type === "@n8n/n8n-nodes-langchain.anthropic") {
+      if (!node.parameters?.resource || !node.parameters?.operation) {
+        issues.push(`Anthropic node "${node.name}" missing resource/operation`);
+      }
+    }
+  }
+
+  if (issues.length > 0) {
+    return { valid: false, issues };
+  }
+
+  return {
+    valid: true,
+    message: `Workflow "${workflow.name}" validated successfully`,
+    nodeCount: workflow.nodes.length,
+    connectionCount: Object.keys(workflow.connections).length
+  };
 }
 
 async function handleSendSlackNotification(message) {
+  log("Sending Slack notification...");
+
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
@@ -412,44 +598,54 @@ async function handleSendSlackNotification(message) {
 async function executeTool(toolName, toolInput) {
   log(`Executing tool: ${toolName}`);
 
-  switch (toolName) {
-    case "get_execution_details":
-      return await handleGetExecutionDetails(toolInput.execution_id);
+  try {
+    switch (toolName) {
+      case "get_execution_details":
+        return await handleGetExecutionDetails(toolInput.execution_id);
 
-    case "get_workflow":
-      return await handleGetWorkflow(toolInput.workflow_id);
+      case "get_workflow":
+        return await handleGetWorkflow(toolInput.workflow_id);
 
-    case "update_node":
-      return await handleUpdateNode(
-        toolInput.workflow_id,
-        toolInput.node_name,
-        toolInput.parameters
-      );
+      case "update_node":
+        return await handleUpdateNode(
+          toolInput.workflow_id,
+          toolInput.node_name,
+          toolInput.parameters
+        );
 
-    case "send_slack_notification":
-      return await handleSendSlackNotification(toolInput.message);
+      case "validate_workflow":
+        return await handleValidateWorkflow(toolInput.workflow_id);
 
-    case "complete":
-      return {
-        done: true,
-        success: toolInput.success,
-        summary: toolInput.summary
-      };
+      case "send_slack_notification":
+        return await handleSendSlackNotification(toolInput.message);
 
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
+      case "complete":
+        return {
+          done: true,
+          success: toolInput.success,
+          summary: toolInput.summary
+        };
+
+      default:
+        throw new Error(`Unknown tool: ${toolName}`);
+    }
+  } catch (error) {
+    log(`Tool error (${toolName}): ${error.message}`);
+    throw error;
   }
 }
 
 // =============================================================================
-// CLAUDE API WITH TOOL USE
+// CLAUDE API WITH TOOL USE (AGENTIC LOOP)
 // =============================================================================
 
 async function runAgentLoop(errorData) {
+  const timestamp = errorData.timestamp || new Date().toISOString();
+
   const messages = [
     {
       role: "user",
-      content: `An n8n workflow has failed. Please analyze and fix if possible.
+      content: `An n8n workflow has failed. Analyze and fix if possible.
 
 ## Error Information
 - **Workflow ID**: ${errorData.workflowId}
@@ -457,20 +653,20 @@ async function runAgentLoop(errorData) {
 - **Failed Node**: ${errorData.failedNodeName}
 - **Error Message**: ${errorData.errorMessage}
 - **Execution ID**: ${errorData.executionId}
-- **Timestamp**: ${errorData.timestamp}
+- **Timestamp**: ${timestamp}
 
-Start by fetching the execution details to understand what went wrong.`
+Start by fetching the execution details to get full context about the error.`
     }
   ];
 
-  const maxIterations = 10;
+  const maxIterations = 15; // Allow more iterations for complex fixes
   let iteration = 0;
 
   while (iteration < maxIterations) {
     iteration++;
-    log(`Agent iteration ${iteration}`);
+    log(`Agent iteration ${iteration}/${maxIterations}`);
 
-    // Call Claude
+    // Call Claude Opus 4.5
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -479,8 +675,8 @@ Start by fetching the execution details to understand what went wrong.`
         "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-5-20250929",
-        max_tokens: 4096,
+        model: CLAUDE_MODEL,
+        max_tokens: 8192,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
         messages: messages
@@ -500,11 +696,11 @@ Start by fetching the execution details to understand what went wrong.`
       content: result.content
     });
 
-    // Check if we're done (no tool use, or stop_reason is end_turn without tools)
+    // Check if we're done
     if (result.stop_reason === "end_turn") {
       const hasToolUse = result.content.some(block => block.type === "tool_use");
       if (!hasToolUse) {
-        log("Agent completed without tool use");
+        log("Agent completed (no more tool calls)");
         break;
       }
     }
@@ -517,7 +713,7 @@ Start by fetching the execution details to understand what went wrong.`
       break;
     }
 
-    // Execute each tool and collect results
+    // Execute each tool
     const toolResults = [];
     let shouldStop = false;
 
@@ -525,7 +721,6 @@ Start by fetching the execution details to understand what went wrong.`
       try {
         const toolResult = await executeTool(toolUse.name, toolUse.input);
 
-        // Check if this is the complete tool
         if (toolResult.done) {
           shouldStop = true;
           log(`Agent completed: ${toolResult.summary}`);
@@ -534,10 +729,9 @@ Start by fetching the execution details to understand what went wrong.`
         toolResults.push({
           type: "tool_result",
           tool_use_id: toolUse.id,
-          content: JSON.stringify(toolResult)
+          content: JSON.stringify(toolResult, null, 2)
         });
       } catch (error) {
-        log(`Tool error (${toolUse.name}): ${error.message}`);
         toolResults.push({
           type: "tool_result",
           tool_use_id: toolUse.id,
@@ -561,7 +755,7 @@ Start by fetching the execution details to understand what went wrong.`
   if (iteration >= maxIterations) {
     log("Agent reached max iterations");
     await handleSendSlackNotification(
-      `:warning: *Auto-Fix Timeout*\n\nWorkflow: ${errorData.workflowName}\nThe auto-fix agent reached maximum iterations without completing.\n\n_Manual investigation required._`
+      `:warning: *Auto-Fix Timeout*\n\nWorkflow: ${errorData.workflowName}\nExecution: ${errorData.executionId}\n\nThe auto-fix agent reached maximum iterations without completing.\n\n_Manual investigation required._`
     );
   }
 }
@@ -583,14 +777,14 @@ async function processError(errorData) {
     return;
   }
 
-  log(`Starting agent for workflow: ${workflowName} (${workflowId})`);
+  log(`Starting agent for: ${workflowName} (${workflowId})`);
 
   try {
     await runAgentLoop(errorData);
   } catch (error) {
     log(`Agent error: ${error.message}`);
     await handleSendSlackNotification(
-      `:rotating_light: *Auto-Fix Failed*\n\nWorkflow: ${workflowName}\nError: ${errorData.errorMessage}\n\n*Agent error:* ${error.message}\n\n_Manual investigation required._`
+      `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${errorData.errorMessage}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
     );
   }
 }
@@ -612,7 +806,7 @@ async function processNext() {
   const workflowId = errorData.workflowId;
 
   if (isOnCooldown(workflowId)) {
-    log(`Skipping ${workflowId} (${errorData.workflowName}) - on cooldown`);
+    log(`Skipping ${workflowId} - on cooldown`);
     processNext();
     return;
   }
@@ -640,9 +834,10 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
+      version: "2.1.0",
+      model: CLAUDE_MODEL,
       queueLength: queue.length,
-      processing,
-      version: "2.0.0"
+      processing
     }));
     return;
   }
@@ -686,11 +881,14 @@ function checkConfig() {
   if (!SLACK_BOT_TOKEN) missing.push("SLACK_BOT_TOKEN");
 
   if (missing.length > 0) {
-    log(`WARNING: Missing environment variables: ${missing.join(", ")}`);
+    log(`WARNING: Missing env vars: ${missing.join(", ")}`);
   }
 
-  log("n8n Auto-Fix Server v2.0.0");
-  log("Features: Tool-based agent, execution context fetching, expert n8n knowledge");
+  log("═══════════════════════════════════════════════════════════");
+  log("  n8n Auto-Fix Server v2.1.0");
+  log("  Model: Claude Opus 4.5 (Most Intelligent)");
+  log("  Features: Full expert knowledge, validation, rich context");
+  log("═══════════════════════════════════════════════════════════");
 }
 
 checkConfig();
