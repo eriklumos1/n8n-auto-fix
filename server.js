@@ -174,37 +174,51 @@ Usually means the record ID is empty/null. Common causes:
 - IF node passing empty data
 - Search node returning no results but alwaysOutputData: true
 - Expression referencing wrong node
+- Airtable Delete operation without explicit id mapping
 
 Fix: Check the IF condition or expression that provides the record ID.
+For Delete operations: MUST have "id": "={{ $json.id }}" explicitly mapped.
 
 ### Expression Errors
 - Wrong property path: Fix the $json reference
 - Referencing wrong node: Use $('Node Name').item.json.field
 - $json is empty: Previous node returned no data, reference source node directly
+- Accessing Airtable fields wrong: Use $json.fields['Field Name'], NOT $json.fieldName
 
 ### Missing resource/operation (Anthropic node)
 The Anthropic node REQUIRES both resource and operation:
 - Add: "resource": "text"
 - Add: "operation": "message"
 
+### Switch Node Import Error ("Could not find property option")
+The Switch node v3.4 has a specific structure. Fix:
+- Change rules.rules to rules.values
+- Change version: 2 to version: 3 in conditions.options
+- Add looseTypeValidation: true at top level
+
+### IF Node Operator Errors
+- Wrong: operator.operation: "isNotEmpty" with singleValue: true
+- Correct: operator.operation: "notEmpty" (no singleValue needed)
+
 ## NOT Auto-Fixable (Notify Only)
 - 401/403: Authentication/credential failures
 - 429/500/502/503: External API issues
-- Network connectivity problems
+- Network connectivity problems (ECONNRESET, ETIMEDOUT)
 - Missing external resources
 - Permission denied errors
+- Credential expiration
 
 ## Lumos Expert Knowledge
 
 ### Verified Credentials (ALWAYS use these IDs)
 | Service | Credential ID | Name |
 |---------|--------------|------|
-| Slack | zxjXo2rPXuHjq0Ei | Lumos Slack |
+| Slack | uN0eQ3WPFX1KUvug | Slack account |
 | Anthropic | tOV9sEG5g7qxBy3v | Lumos - Anthropic |
 | OpenAI | SGBYTOrjNKrLWMao | Lumos - OpenAI |
 | Airtable | nnp50zxomNRPb9PV | Airtable - Agentic |
 
-### Verified typeVersions (MUST use these)
+### Verified typeVersions (MUST use these - from live instance)
 | Node Type | Version |
 |-----------|---------|
 | n8n-nodes-base.webhook | 2.1 |
@@ -212,33 +226,51 @@ The Anthropic node REQUIRES both resource and operation:
 | n8n-nodes-base.code | 2 |
 | n8n-nodes-base.set | 3.4 |
 | n8n-nodes-base.if | 2.2 |
+| n8n-nodes-base.filter | 2.2 |
 | n8n-nodes-base.slack | 2.2 |
 | n8n-nodes-base.airtable | 2.1 |
 | n8n-nodes-base.switch | 3.4 |
+| n8n-nodes-base.noOp | 1 |
+| n8n-nodes-base.splitOut | 1 |
+| n8n-nodes-base.gmailTrigger | 1.3 |
 | @n8n/n8n-nodes-langchain.anthropic | 1 |
 | @n8n/n8n-nodes-langchain.openAi | 1.6 |
 
-### Airtable Table IDs
+### Airtable Table IDs (Content OS)
 | Table | Base ID | Table ID |
 |-------|---------|----------|
-| LI Conversations | app5AMIkyZZ8OOygP | tblnh62jE0TLIICCY |
 | Content OS Base | appP3XYuyhYRTmEDv | - |
+| Reddit Posts | appP3XYuyhYRTmEDv | tblkv7c4M7RnVi11c |
+| Transcripts | appP3XYuyhYRTmEDv | tblBLZeR6ZrV6IrL9 |
+| LinkedIn Posts (Viral) | appP3XYuyhYRTmEDv | tbldVw24D6YnBjwqm |
+| Content Queue | appP3XYuyhYRTmEDv | tbl5nA0KhexsSobz2 |
 | Content Ready Queue | appP3XYuyhYRTmEDv | tbl1xc0xmffTBvgFi |
 | Hook Library | appP3XYuyhYRTmEDv | tbl0jCr4oCQPqTELo |
+| Brand Voice | appP3XYuyhYRTmEDv | tblDXGrmtgAp7H1bc |
+| LI Conversations | app5AMIkyZZ8OOygP | tblnh62jE0TLIICCY |
 
-### Expression Data Flow Rules
-CRITICAL: $json only contains data from the IMMEDIATELY PREVIOUS node.
+### Expression Data Flow Rules (CRITICAL)
+$json ONLY contains data from the IMMEDIATELY PREVIOUS node.
 
 When to use $('Node Name').item.json.field:
 - Previous node is a lookup/search that may return empty
 - Previous node is an IF/Switch that doesn't carry forward data
 - Previous node transforms or filters data
+- After ANY Airtable operation (they only return the Airtable record)
 - Any time the field you need is NOT from immediate predecessor
 
-Common pattern after Airtable operations:
-- Airtable Update/Create ONLY returns the Airtable record
-- All upstream data is LOST
-- MUST reference source node: $('Original Node').item.json.field
+### Airtable Output Format (v2.1)
+Airtable Update/Create operations return records with a fields wrapper:
+- Record ID at top level: $json.id
+- All fields nested: $json.fields['Field Name']
+- WRONG: $json.fieldName or $json['Field Name']
+- CORRECT: $json.fields['Field Name']
+
+### Data Loss After Airtable Operations
+Airtable Update/Create ONLY returns the Airtable record — all upstream workflow data is LOST.
+When a node after Airtable needs upstream data:
+- WRONG: $json.prospectName (undefined!)
+- CORRECT: $('Source Node').item.json.prospectName
 
 ### IF Node with alwaysOutputData Issue
 If a search node has alwaysOutputData: true, it outputs an empty item even with no results.
@@ -247,28 +279,73 @@ FIX: Check for actual data, not just item existence:
 - Wrong: $('Search Node').all().length > 0
 - Right: $('Search Node').first().json.id (check for actual field)
 
-### Airtable CRUD Notes
-- Operations are CAPITALIZED: "Delete", "Update", "Create"
+### Airtable CRUD Operations
+- Operations are CAPITALIZED: "Delete", "Update", "Create" (NOT lowercase)
 - Delete REQUIRES explicit id mapping: "id": "={{ $json.id }}"
 - Update uses matchingColumns: ["id"]
-- ALWAYS enable typecast: true in options
+- ALWAYS enable typecast: true in options for reliability
+- ALWAYS add retry settings: retryOnFail: true, maxTries: 3, waitBetweenTries: 2000
 
-### Switch Node v3.4 Structure
-- Use rules.values (NOT rules.rules)
-- Options need version: 3 (NOT version: 2)
-- Require looseTypeValidation: true at top level
+### Number Field Deletion Bug (Airtable)
+When removing number fields from mappings, the default value (0) can persist.
+If you see unexpected 0 values being written, the field needs to be removed from BOTH:
+- columns.value object (remove the key-value pair)
+- columns.schema array (remove the object with matching id)
 
-### Anthropic Node Requirements
-MUST have:
-- resource: "text"
-- operation: "message"
-- messages.values[].role: "user"
+### Switch Node v3.4 Structure (EXACT FORMAT)
+{
+  "parameters": {
+    "rules": {
+      "values": [  // MUST be "values", NOT "rules"
+        {
+          "conditions": {
+            "options": {
+              "version": 3,  // MUST be 3, NOT 2
+              "typeValidation": "loose"
+            },
+            "conditions": [...],
+            "combinator": "and"
+          },
+          "outputKey": "OutputName"
+        }
+      ]
+    },
+    "looseTypeValidation": true  // REQUIRED at top level
+  },
+  "typeVersion": 3.4
+}
+
+### Anthropic Node Requirements (CRITICAL)
+MUST have ALL of these:
+- resource: "text" (REQUIRED)
+- operation: "message" (REQUIRED)
+- messages.values[].role: "user" (each message needs role)
 - typeVersion: 1 (NOT 1.3)
+- System prompt goes in options.systemMessage, NOT in messages array
+
+### Slack Node Attribution
+ALWAYS ensure otherOptions.includeLinkToWorkflow: false
+This prevents "Automate with n8n" footers in messages.
 
 ### Common Model IDs
 - Claude Opus 4.5: claude-opus-4-5-20251101
 - Claude Sonnet 4.5: claude-sonnet-4-5-20250929
 - GPT-5.2: gpt-5.2
+
+### Node-Level Retry Settings (for resilience)
+Add to API/external nodes:
+{
+  "retryOnFail": true,
+  "maxTries": 3,
+  "waitBetweenTries": 5000,
+  "continueOnFail": false  // or true for non-critical nodes
+}
+
+Recommended wait times:
+- API Rate Limit: 60000ms (60s)
+- Transient Network: 5000ms (5s)
+- External Service: 15000ms (15s)
+- Database: 2000ms (2s)
 
 ## Guardrails
 - NEVER modify credentials or authentication settings
