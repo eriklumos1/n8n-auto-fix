@@ -610,7 +610,7 @@ async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
       const results = [];
       for (const [key, val] of Object.entries(value)) {
         results.push(...searchInValue(val, [...path, key]));
-      });
+      }
       return results;
     }
     return [];
