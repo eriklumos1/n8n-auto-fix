@@ -73,6 +73,39 @@ Returns:
     }
   },
   {
+    name: "scan_workflow_for_pattern",
+    description: `CRITICAL: After identifying a root cause, use this to find ALL nodes in the workflow with the same problematic pattern.
+
+This prevents partial fixes where only the immediately failing node gets fixed while other nodes with the same bug remain broken.
+
+Examples of patterns to scan for:
+- Expression patterns: "$('Check Existing Record').item.json.id"
+- Field references: "total_messages"
+- Node references: specific node names in expressions
+- Configuration patterns: missing required fields
+
+Returns all nodes that contain the pattern, so you can fix them ALL.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        workflow_id: {
+          type: "string",
+          description: "The workflow ID to scan"
+        },
+        pattern: {
+          type: "string",
+          description: "The exact string pattern to search for in node configurations"
+        },
+        pattern_type: {
+          type: "string",
+          enum: ["expression", "field_name", "node_reference", "config_value"],
+          description: "Type of pattern being searched"
+        }
+      },
+      required: ["workflow_id", "pattern"]
+    }
+  },
+  {
     name: "update_node",
     description: `Update a specific node's parameters in the workflow. Use this to fix node configurations.
 
@@ -151,12 +184,32 @@ The parameters object should be the COMPLETE new parameters for the node.`,
 
 const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.5, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
 
-## Your Process
+## Your Process (COMPREHENSIVE FIX)
 1. ALWAYS start by calling get_execution_details to understand the full error context
 2. Analyze the error type and determine if it's auto-fixable
-3. If fixable: Apply the fix using update_node, then validate with validate_workflow
-4. Send a Slack notification with results
-5. Call complete() when done
+3. **CRITICAL: If the error involves a pattern (expression, field reference, node reference):**
+   a. Call scan_workflow_for_pattern to find ALL nodes with the same problematic pattern
+   b. This prevents partial fixes where only the failing node gets fixed
+4. Fix ALL affected nodes, not just the immediately failing one
+5. Validate with validate_workflow after ALL fixes are applied
+6. Send a Slack notification with complete results (list ALL nodes fixed)
+7. Call complete() when done
+
+## IMPORTANT: Comprehensive Fix Rule
+When you identify a root cause like:
+- Wrong node reference: "$('Check Existing Record').item.json.id" should be "$('Create or update a record').item.json.id"
+- Unknown field: "total_messages" doesn't exist in Airtable
+- Missing data reference: Previous node returns empty, need to reference source node
+
+**You MUST scan the ENTIRE workflow for the same pattern before fixing.**
+Other nodes likely have the same bug and will fail later if not fixed now.
+
+Example: If "Update Handoff Status" fails because it references "$('Check Existing Record').item.json.id":
+1. Get execution details → identify the bad pattern
+2. SCAN: scan_workflow_for_pattern(workflow_id, "$('Check Existing Record').item.json.id")
+3. Results show 3 nodes use this pattern: "Update Handoff Status", "Update Record (Preserve Status)", "Push to Clay"
+4. FIX ALL 3 nodes, not just the one that happened to fail first
+5. Validate, notify, complete
 
 ## Auto-Fixable Errors (YOU MUST FIX THESE)
 
@@ -357,7 +410,7 @@ Recommended wait times:
 
 ## Slack Message Format
 
-For FIXED errors:
+For FIXED errors (SINGLE NODE):
 \`:white_check_mark: *Auto-Fixed: {workflow_name}*
 
 *Error:* {error_message}
@@ -368,6 +421,23 @@ For FIXED errors:
 *Validation:* Passed
 
 _Auto-fixed by Claude Opus 4.5 at {timestamp}_\`
+
+For FIXED errors (MULTIPLE NODES - use this when scan found related issues):
+\`:white_check_mark: *Auto-Fixed: {workflow_name}* (Comprehensive)
+
+*Original Error:* {error_message}
+*Root Cause:* {pattern or issue identified}
+*Execution:* {execution_id}
+
+*Comprehensive Fix Applied:*
+• {node_name_1}: {what was changed}
+• {node_name_2}: {what was changed}
+• {node_name_3}: {what was changed}
+
+*Pattern Scan:* Found {N} nodes with same issue - all fixed
+*Validation:* Passed
+
+_Comprehensively fixed by Claude Opus 4.5 at {timestamp}_\`
 
 For NOT FIXABLE errors:
 \`:rotating_light: *Action Required: {workflow_name}*
@@ -502,6 +572,80 @@ async function handleGetWorkflow(workflowId) {
       alwaysOutputData: n.alwaysOutputData
     })),
     connections: workflow.connections
+  };
+}
+
+async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
+  log(`Scanning workflow ${workflowId} for pattern: "${pattern}" (${patternType || 'any'})...`);
+
+  const url = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
+  const res = await fetch(url, {
+    headers: { "X-N8N-API-KEY": N8N_API_KEY }
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to fetch workflow: ${res.status} - ${text}`);
+  }
+
+  const workflow = await res.json();
+  const matches = [];
+
+  // Deep search function to find pattern in any nested object/string
+  function searchInValue(value, path = []) {
+    if (typeof value === 'string') {
+      if (value.includes(pattern)) {
+        return [{ path: path.join('.'), value, matchType: 'string' }];
+      }
+      return [];
+    }
+    if (Array.isArray(value)) {
+      const results = [];
+      value.forEach((item, index) => {
+        results.push(...searchInValue(item, [...path, `[${index}]`]));
+      });
+      return results;
+    }
+    if (typeof value === 'object' && value !== null) {
+      const results = [];
+      for (const [key, val] of Object.entries(value)) {
+        results.push(...searchInValue(val, [...path, key]));
+      });
+      return results;
+    }
+    return [];
+  }
+
+  // Scan each node
+  for (const node of workflow.nodes) {
+    const nodeMatches = searchInValue(node.parameters, ['parameters']);
+
+    if (nodeMatches.length > 0) {
+      matches.push({
+        nodeName: node.name,
+        nodeType: node.type,
+        nodeId: node.id,
+        occurrences: nodeMatches.map(m => ({
+          location: m.path,
+          currentValue: m.value
+        })),
+        fullParameters: node.parameters
+      });
+    }
+  }
+
+  return {
+    workflowId,
+    workflowName: workflow.name,
+    pattern,
+    patternType: patternType || 'any',
+    totalMatches: matches.length,
+    affectedNodes: matches,
+    recommendation: matches.length > 1
+      ? `CRITICAL: Found ${matches.length} nodes with this pattern. Fix ALL of them to prevent future failures.`
+      : matches.length === 1
+        ? `Found 1 node with this pattern.`
+        : `No nodes found with this pattern.`
   };
 }
 
@@ -682,6 +826,13 @@ async function executeTool(toolName, toolInput) {
 
       case "get_workflow":
         return await handleGetWorkflow(toolInput.workflow_id);
+
+      case "scan_workflow_for_pattern":
+        return await handleScanWorkflowForPattern(
+          toolInput.workflow_id,
+          toolInput.pattern,
+          toolInput.pattern_type
+        );
 
       case "update_node":
         return await handleUpdateNode(
@@ -911,8 +1062,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "2.1.0",
+      version: "3.0.0",
       model: CLAUDE_MODEL,
+      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix"],
       queueLength: queue.length,
       processing
     }));
@@ -962,9 +1114,10 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v2.1.0");
+  log("  n8n Auto-Fix Server v3.0.0");
   log("  Model: Claude Opus 4.5 (Most Intelligent)");
-  log("  Features: Full expert knowledge, validation, rich context");
+  log("  Features: COMPREHENSIVE workflow scanning, pattern detection");
+  log("  NEW: Fixes ALL nodes with same bug, not just failing node");
   log("═══════════════════════════════════════════════════════════");
 }
 
