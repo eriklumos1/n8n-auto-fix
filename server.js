@@ -17,6 +17,9 @@ const ERROR_WORKFLOW_ID = "JtMGyvm5ub4nlDxe";
 // Cooldown to prevent repeated fix attempts
 const COOLDOWN_MS = 5 * 60 * 1000;
 
+// Maximum retries after successful fix
+const MAX_RETRIES = 2;
+
 // Use the most intelligent model
 const CLAUDE_MODEL = "claude-opus-4-5-20251101";
 
@@ -27,6 +30,9 @@ const CLAUDE_MODEL = "claude-opus-4-5-20251101";
 const queue = [];
 let processing = false;
 const lastProcessed = new Map();
+
+// Retry chain tracking: executionId -> {originalExecutionId, retryCount, workflowId, workflowName}
+const retryChains = new Map();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -159,6 +165,40 @@ The parameters object should be the COMPLETE new parameters for the node.`,
     }
   },
   {
+    name: "retry_execution",
+    description: `Retry a failed execution after successfully fixing the workflow. This re-runs the execution to verify the fix works.
+
+IMPORTANT RULES:
+- Only call this AFTER a successful fix AND validation
+- Check the retry_context in the error info - if retryCount >= 2, DO NOT retry (max retries reached)
+- The system will automatically send a Slack notification about the retry
+- If the retry fails, you'll receive the new error automatically
+
+Returns the new execution ID if successful.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        execution_id: {
+          type: "string",
+          description: "The execution ID to retry"
+        },
+        workflow_id: {
+          type: "string",
+          description: "The workflow ID (for tracking)"
+        },
+        workflow_name: {
+          type: "string",
+          description: "The workflow name (for Slack notification)"
+        },
+        fix_summary: {
+          type: "string",
+          description: "Brief summary of what was fixed (for Slack notification)"
+        }
+      },
+      required: ["execution_id", "workflow_id", "workflow_name", "fix_summary"]
+    }
+  },
+  {
     name: "complete",
     description: "Call this when finished. Indicate whether the fix was successful and provide a summary.",
     input_schema: {
@@ -184,7 +224,7 @@ The parameters object should be the COMPLETE new parameters for the node.`,
 
 const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.5, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
 
-## Your Process (COMPREHENSIVE FIX)
+## Your Process (COMPREHENSIVE FIX + RETRY)
 1. ALWAYS start by calling get_execution_details to understand the full error context
 2. Analyze the error type and determine if it's auto-fixable
 3. **CRITICAL: If the error involves a pattern (expression, field reference, node reference):**
@@ -193,7 +233,19 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 4. Fix ALL affected nodes, not just the immediately failing one
 5. Validate with validate_workflow after ALL fixes are applied
 6. Send a Slack notification with complete results (list ALL nodes fixed)
-7. Call complete() when done
+7. **RETRY STEP (if fix was successful):**
+   - Check the retry_context in the error info
+   - If retryCount < 2 (max retries), call retry_execution to verify the fix works
+   - If retryCount >= 2, DO NOT retry - send "max retries reached" notification instead
+   - The retry will automatically re-run the workflow; if it fails again, you'll get a new error
+8. Call complete() when done
+
+## Retry Rules (IMPORTANT)
+- After a SUCCESSFUL fix + validation, you SHOULD call retry_execution to close the loop
+- The retry_execution tool will send its own Slack notification - you don't need to notify about the retry separately
+- If retry_context shows retryCount >= 2, do NOT retry - instead send a "max retries reached" message
+- Each retry counts: if the workflow fails at a DIFFERENT node after retry, it still uses up a retry
+- Max 2 retries total per execution chain (original fail → fix → retry1 → fail → fix → retry2 → fail → stop)
 
 ## IMPORTANT: Comprehensive Fix Rule
 When you identify a root cause like:
@@ -453,7 +505,27 @@ For NOT FIXABLE errors:
 2. {step 2}
 3. {step 3}
 
-_Analyzed by Claude Opus 4.5 at {timestamp}_\``;
+_Analyzed by Claude Opus 4.5 at {timestamp}_\`
+
+For MAX RETRIES REACHED (when retryCount >= 2 and still failing):
+\`:stop_sign: *Max Retries Reached: {workflow_name}*
+
+*Error:* {error_message}
+*Failed Node:* {node_name}
+*Execution:* <{execution_url}|View Execution #{execution_id}>
+
+*Retry History:*
+• Original execution: {original_execution_id}
+• Retries attempted: 2/2
+
+*Why stopping:* The workflow has been fixed and retried twice but is still encountering errors. This indicates a deeper issue that requires manual investigation.
+
+*Suggested next steps:*
+1. Review the execution history to see which nodes failed at each attempt
+2. Check if the issue is data-dependent (specific input causing failures)
+3. Test the workflow manually with sample data
+
+_Manual investigation required._\``;
 
 // =============================================================================
 // TOOL HANDLERS
@@ -816,6 +888,76 @@ async function handleSendSlackNotification(message) {
   return { success: true, message: "Notification sent to Slack" };
 }
 
+async function handleRetryExecution(executionId, workflowId, workflowName, fixSummary) {
+  log(`Retrying execution ${executionId}...`);
+
+  // Get current retry count for this chain
+  const chainInfo = retryChains.get(executionId);
+  const currentRetryCount = chainInfo ? chainInfo.retryCount : 0;
+  const originalExecutionId = chainInfo ? chainInfo.originalExecutionId : executionId;
+
+  if (currentRetryCount >= MAX_RETRIES) {
+    return {
+      success: false,
+      error: `Max retries (${MAX_RETRIES}) reached for this execution chain`,
+      retryCount: currentRetryCount
+    };
+  }
+
+  // Call n8n API to retry the execution
+  const url = `${N8N_API_URL}/api/v1/executions/${executionId}/retry`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-N8N-API-KEY": N8N_API_KEY
+    }
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to retry execution: ${res.status} - ${text}`);
+  }
+
+  const retryResult = await res.json();
+  const newExecutionId = retryResult.id;
+  const newRetryCount = currentRetryCount + 1;
+
+  // Track the new execution in the retry chain
+  retryChains.set(newExecutionId, {
+    originalExecutionId,
+    retryCount: newRetryCount,
+    workflowId,
+    workflowName,
+    previousExecutionId: executionId,
+    timestamp: Date.now()
+  });
+
+  // Build execution URL
+  const executionUrl = `${N8N_API_URL}/workflow/${workflowId}/executions/${newExecutionId}`;
+
+  // Send Slack notification about retry
+  const retryMessage = `:arrows_counterclockwise: *Retry Triggered: ${workflowName}* (${newRetryCount}/${MAX_RETRIES})
+
+*Fix Applied:* ${fixSummary}
+*Original Execution:* ${originalExecutionId}
+*New Execution:* <${executionUrl}|View Execution #${newExecutionId}>
+
+_Retrying to verify the fix works..._`;
+
+  await handleSendSlackNotification(retryMessage);
+
+  log(`Retry triggered: ${newExecutionId} (retry ${newRetryCount}/${MAX_RETRIES})`);
+
+  return {
+    success: true,
+    newExecutionId,
+    retryCount: newRetryCount,
+    maxRetries: MAX_RETRIES,
+    message: `Execution retried. New execution ID: ${newExecutionId} (retry ${newRetryCount}/${MAX_RETRIES})`
+  };
+}
+
 async function executeTool(toolName, toolInput) {
   log(`Executing tool: ${toolName}`);
 
@@ -847,6 +989,14 @@ async function executeTool(toolName, toolInput) {
       case "send_slack_notification":
         return await handleSendSlackNotification(toolInput.message);
 
+      case "retry_execution":
+        return await handleRetryExecution(
+          toolInput.execution_id,
+          toolInput.workflow_id,
+          toolInput.workflow_name,
+          toolInput.fix_summary
+        );
+
       case "complete":
         return {
           done: true,
@@ -867,8 +1017,29 @@ async function executeTool(toolName, toolInput) {
 // CLAUDE API WITH TOOL USE (AGENTIC LOOP)
 // =============================================================================
 
-async function runAgentLoop(errorData) {
+async function runAgentLoop(errorData, retryContext = null) {
   const timestamp = errorData.timestamp || new Date().toISOString();
+
+  // Build retry context string if this is part of a retry chain
+  let retryInfo = "";
+  if (retryContext) {
+    retryInfo = `
+
+## Retry Context
+- **This is retry attempt**: ${retryContext.retryCount}/${MAX_RETRIES}
+- **Original Execution ID**: ${retryContext.originalExecutionId}
+- **Previous Execution ID**: ${retryContext.previousExecutionId}
+- **IMPORTANT**: ${retryContext.retryCount >= MAX_RETRIES
+    ? "MAX RETRIES REACHED - DO NOT call retry_execution again. Send a 'max retries reached' notification instead."
+    : `You can retry ${MAX_RETRIES - retryContext.retryCount} more time(s) after fixing.`}`;
+  } else {
+    retryInfo = `
+
+## Retry Context
+- **This is the original failure** (not a retry)
+- **Retries available**: ${MAX_RETRIES}
+- **After fixing**: Call retry_execution to verify the fix works`;
+  }
 
   const messages = [
     {
@@ -882,7 +1053,7 @@ async function runAgentLoop(errorData) {
 - **Error Message**: ${errorData.errorMessage}
 - **Execution ID**: ${errorData.executionId}
 - **Execution URL**: ${errorData.executionUrl}
-- **Timestamp**: ${timestamp}
+- **Timestamp**: ${timestamp}${retryInfo}
 
 Start by fetching the execution details to get full context about the error.`
     }
@@ -996,6 +1167,7 @@ Start by fetching the execution details to get full context about the error.`
 async function processError(errorData) {
   const workflowId = errorData.workflowId;
   const workflowName = errorData.workflowName || "Unknown";
+  const executionId = errorData.executionId;
 
   // Guard: never auto-fix the error workflow itself
   if (workflowId === ERROR_WORKFLOW_ID) {
@@ -1006,15 +1178,29 @@ async function processError(errorData) {
     return;
   }
 
-  log(`Starting agent for: ${workflowName} (${workflowId})`);
+  // Check if this execution is part of a retry chain
+  const retryContext = retryChains.get(executionId);
+  if (retryContext) {
+    log(`This is retry ${retryContext.retryCount}/${MAX_RETRIES} for chain starting at ${retryContext.originalExecutionId}`);
+  }
+
+  log(`Starting agent for: ${workflowName} (${workflowId})${retryContext ? ` [Retry ${retryContext.retryCount}/${MAX_RETRIES}]` : ''}`);
 
   try {
-    await runAgentLoop(errorData);
+    await runAgentLoop(errorData, retryContext);
   } catch (error) {
     log(`Agent error: ${error.message}`);
     await handleSendSlackNotification(
       `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${errorData.errorMessage}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
     );
+  }
+
+  // Clean up old retry chain entries (older than 1 hour) to prevent memory leaks
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  for (const [execId, chain] of retryChains.entries()) {
+    if (chain.timestamp && chain.timestamp < oneHourAgo) {
+      retryChains.delete(execId);
+    }
   }
 }
 
@@ -1063,9 +1249,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "3.0.0",
+      version: "4.0.0",
       model: CLAUDE_MODEL,
-      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix"],
+      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry"],
+      maxRetries: MAX_RETRIES,
+      activeRetryChains: retryChains.size,
       queueLength: queue.length,
       processing
     }));
@@ -1115,10 +1303,10 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v3.0.0");
+  log("  n8n Auto-Fix Server v4.0.0");
   log("  Model: Claude Opus 4.5 (Most Intelligent)");
-  log("  Features: COMPREHENSIVE workflow scanning, pattern detection");
-  log("  NEW: Fixes ALL nodes with same bug, not just failing node");
+  log("  Features: Comprehensive scan, pattern detection, auto-retry");
+  log("  NEW: Auto-retry after fix (max 2) to close the loop");
   log("═══════════════════════════════════════════════════════════");
 }
 
