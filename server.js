@@ -415,7 +415,7 @@ For FIXED errors (SINGLE NODE):
 
 *Error:* {error_message}
 *Failed Node:* {node_name}
-*Execution:* {execution_id}
+*Execution:* <{execution_url}|View Execution #{execution_id}>
 
 *Fix Applied:* {specific description of what was changed}
 *Validation:* Passed
@@ -427,7 +427,7 @@ For FIXED errors (MULTIPLE NODES - use this when scan found related issues):
 
 *Original Error:* {error_message}
 *Root Cause:* {pattern or issue identified}
-*Execution:* {execution_id}
+*Execution:* <{execution_url}|View Execution #{execution_id}>
 
 *Comprehensive Fix Applied:*
 • {node_name_1}: {what was changed}
@@ -444,7 +444,7 @@ For NOT FIXABLE errors:
 
 *Error:* {error_message}
 *Failed Node:* {node_name}
-*Execution:* {execution_id}
+*Execution:* <{execution_url}|View Execution #{execution_id}>
 
 *Why this can't be auto-fixed:* {explanation}
 
@@ -881,6 +881,7 @@ async function runAgentLoop(errorData) {
 - **Failed Node**: ${errorData.failedNodeName}
 - **Error Message**: ${errorData.errorMessage}
 - **Execution ID**: ${errorData.executionId}
+- **Execution URL**: ${errorData.executionUrl}
 - **Timestamp**: ${timestamp}
 
 Start by fetching the execution details to get full context about the error.`
