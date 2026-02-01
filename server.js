@@ -31,11 +31,68 @@ const queue = [];
 let processing = false;
 const lastProcessed = new Map();
 
-// Retry chain tracking: executionId -> {originalExecutionId, retryCount, workflowId, workflowName}
+// Retry chain tracking: executionId -> {originalExecutionId, retryCount, workflowId, workflowName, errorSignature, fixHistory}
 const retryChains = new Map();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// =============================================================================
+// ERROR SIGNATURE UTILITIES
+// =============================================================================
+
+/**
+ * Create a signature for an error to compare with previous errors
+ * Returns: { node, errorType, errorMessage }
+ */
+function createErrorSignature(errorData) {
+  return {
+    node: errorData.failedNodeName || "Unknown",
+    errorType: extractErrorType(errorData.errorMessage || ""),
+    errorMessage: (errorData.errorMessage || "").substring(0, 200) // Truncate for comparison
+  };
+}
+
+/**
+ * Extract error type from error message (e.g., UNKNOWN_FIELD_NAME, INVALID_RECORDS)
+ */
+function extractErrorType(errorMessage) {
+  // Common n8n/Airtable error patterns
+  const patterns = [
+    /Unknown field name/i,
+    /UNKNOWN_FIELD_NAME/i,
+    /INVALID_RECORDS/i,
+    /Your request is invalid/i,
+    /Could not find property/i,
+    /Cannot read propert/i,
+    /is not defined/i,
+    /401|403|Unauthorized|Forbidden/i,
+    /429|Rate limit/i,
+    /500|502|503|504|Internal Server Error/i,
+    /ECONNRESET|ETIMEDOUT|Network/i
+  ];
+
+  for (const pattern of patterns) {
+    if (pattern.test(errorMessage)) {
+      return pattern.source.replace(/[\\|\/\[\]()]/g, '').substring(0, 30);
+    }
+  }
+  return "GENERAL_ERROR";
+}
+
+/**
+ * Compare two error signatures
+ * Returns: "same_error" | "same_node_different_error" | "different_node"
+ */
+function compareErrorSignatures(prev, current) {
+  if (prev.node !== current.node) {
+    return "different_node";
+  }
+  if (prev.errorType === current.errorType && prev.errorMessage === current.errorMessage) {
+    return "same_error";
+  }
+  return "same_node_different_error";
 }
 
 // =============================================================================
@@ -246,6 +303,35 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 - If retry_context shows retryCount >= 2, do NOT retry - instead send a "max retries reached" message
 - Each retry counts: if the workflow fails at a DIFFERENT node after retry, it still uses up a retry
 - Max 2 retries total per execution chain (original fail → fix → retry1 → fail → fix → retry2 → fail → stop)
+
+## CRITICAL: Handling Retry Failures (ERROR SIGNATURE COMPARISON)
+
+When you receive an error that is part of a retry chain (retry_context is present), the system compares error signatures. Check the **error_comparison** field:
+
+### If error_comparison = "same_error"
+The SAME error occurred at the SAME node after your fix. This means:
+- Your previous fix DID NOT WORK
+- You need to try a DIFFERENT approach
+- Review what was tried before (see fix_history) and try something else
+- Consider if you misdiagnosed the root cause
+
+**Action:** Investigate deeper, try a different fix strategy, or mark as not auto-fixable if you've exhausted options.
+
+### If error_comparison = "same_node_different_error"
+The same node failed but with a DIFFERENT error. This means:
+- Your previous fix may have partially worked
+- There's another issue with the same node
+- Fix this new error
+
+**Action:** Analyze the new error and fix it.
+
+### If error_comparison = "different_node"
+A DIFFERENT node is now failing. This means:
+- Your previous fix WORKED (that node passed!)
+- But it uncovered another issue downstream
+- This is progress - the workflow got further
+
+**Action:** Fix this new node's error. The chain continues.
 
 ## IMPORTANT: Comprehensive Fix Rule
 When you identify a root cause like:
@@ -525,7 +611,21 @@ For MAX RETRIES REACHED (when retryCount >= 2 and still failing):
 2. Check if the issue is data-dependent (specific input causing failures)
 3. Test the workflow manually with sample data
 
-_Manual investigation required._\``;
+_Manual investigation required._\`
+
+For RETRY FAILURE with SAME ERROR (fix didn't work):
+\`:warning: *Previous Fix Didn't Work: {workflow_name}*
+
+*Error:* {error_message} (same as before)
+*Failed Node:* {node_name}
+*Execution:* <{execution_url}|View Execution #{execution_id}>
+
+*Previous Fix Attempted:* {fix_history}
+*Result:* Same error occurred - fix was ineffective
+
+*New Approach:* {what you're trying differently}
+
+_Troubleshooting by Claude Opus 4.5..._\``;
 
 // =============================================================================
 // TOOL HANDLERS
@@ -923,6 +1023,17 @@ async function handleRetryExecution(executionId, workflowId, workflowName, fixSu
   const newExecutionId = retryResult.id;
   const newRetryCount = currentRetryCount + 1;
 
+  // Build fix history
+  const previousFixHistory = chainInfo?.fixHistory || [];
+  const newFixHistory = [...previousFixHistory, {
+    attempt: newRetryCount,
+    fix: fixSummary,
+    timestamp: new Date().toISOString()
+  }];
+
+  // Create error signature for tracking
+  const currentErrorSignature = chainInfo?.errorSignature || null;
+
   // Track the new execution in the retry chain
   retryChains.set(newExecutionId, {
     originalExecutionId,
@@ -930,6 +1041,8 @@ async function handleRetryExecution(executionId, workflowId, workflowName, fixSu
     workflowId,
     workflowName,
     previousExecutionId: executionId,
+    errorSignature: currentErrorSignature,
+    fixHistory: newFixHistory,
     timestamp: Date.now()
   });
 
@@ -1023,12 +1136,33 @@ async function runAgentLoop(errorData, retryContext = null) {
   // Build retry context string if this is part of a retry chain
   let retryInfo = "";
   if (retryContext) {
+    // Format fix history
+    const fixHistoryStr = retryContext.fixHistory && retryContext.fixHistory.length > 0
+      ? retryContext.fixHistory.map((f, i) => `  ${i + 1}. ${f.fix}`).join("\n")
+      : "  (none recorded)";
+
     retryInfo = `
 
 ## Retry Context
 - **This is retry attempt**: ${retryContext.retryCount}/${MAX_RETRIES}
 - **Original Execution ID**: ${retryContext.originalExecutionId}
 - **Previous Execution ID**: ${retryContext.previousExecutionId}
+- **Error Comparison**: ${retryContext.errorComparison || "unknown"}
+- **Previous Error Node**: ${retryContext.previousErrorSignature?.node || "unknown"}
+- **Previous Error Type**: ${retryContext.previousErrorSignature?.errorType || "unknown"}
+
+### Fix History (what was already tried):
+${fixHistoryStr}
+
+### Interpretation:
+${retryContext.errorComparison === "same_error"
+    ? "**SAME ERROR** - Your previous fix DID NOT WORK. Try a DIFFERENT approach or mark as not auto-fixable."
+    : retryContext.errorComparison === "same_node_different_error"
+    ? "**SAME NODE, DIFFERENT ERROR** - Previous fix partially worked. Fix this new error."
+    : retryContext.errorComparison === "different_node"
+    ? "**DIFFERENT NODE** - Your previous fix WORKED! The workflow got further. Fix this new node."
+    : "First retry - compare with original error."}
+
 - **IMPORTANT**: ${retryContext.retryCount >= MAX_RETRIES
     ? "MAX RETRIES REACHED - DO NOT call retry_execution again. Send a 'max retries reached' notification instead."
     : `You can retry ${MAX_RETRIES - retryContext.retryCount} more time(s) after fixing.`}`;
@@ -1179,9 +1313,41 @@ async function processError(errorData) {
   }
 
   // Check if this execution is part of a retry chain
-  const retryContext = retryChains.get(executionId);
+  let retryContext = retryChains.get(executionId);
+
   if (retryContext) {
+    // This is a retry that failed - compare error signatures
+    const currentSignature = createErrorSignature(errorData);
+    const previousSignature = retryContext.errorSignature;
+
+    if (previousSignature) {
+      const comparison = compareErrorSignatures(previousSignature, currentSignature);
+      retryContext.errorComparison = comparison;
+      retryContext.previousErrorSignature = previousSignature;
+      log(`Retry failure comparison: ${comparison} (prev: ${previousSignature.node}/${previousSignature.errorType}, curr: ${currentSignature.node}/${currentSignature.errorType})`);
+    }
+
+    // Update the signature for next potential retry
+    retryContext.errorSignature = currentSignature;
+
     log(`This is retry ${retryContext.retryCount}/${MAX_RETRIES} for chain starting at ${retryContext.originalExecutionId}`);
+  } else {
+    // First failure - create initial error signature for future comparison
+    const initialSignature = createErrorSignature(errorData);
+
+    // Store in a temporary map for when retry comes back
+    // We'll create the full chain entry when retry_execution is called
+    retryChains.set(executionId, {
+      originalExecutionId: executionId,
+      retryCount: 0,
+      workflowId,
+      workflowName,
+      errorSignature: initialSignature,
+      fixHistory: [],
+      timestamp: Date.now()
+    });
+
+    log(`Original failure - created error signature: ${initialSignature.node}/${initialSignature.errorType}`);
   }
 
   log(`Starting agent for: ${workflowName} (${workflowId})${retryContext ? ` [Retry ${retryContext.retryCount}/${MAX_RETRIES}]` : ''}`);
@@ -1219,11 +1385,20 @@ async function processNext() {
 
   const errorData = queue.shift();
   const workflowId = errorData.workflowId;
+  const executionId = errorData.executionId;
 
-  if (isOnCooldown(workflowId)) {
-    log(`Skipping ${workflowId} - on cooldown`);
+  // Check if this execution is part of a retry chain BEFORE checking cooldown
+  const isRetryChainError = retryChains.has(executionId);
+
+  // Bypass cooldown for retry chain errors - they need troubleshooting
+  if (!isRetryChainError && isOnCooldown(workflowId)) {
+    log(`Skipping ${workflowId} - on cooldown (not a retry chain)`);
     processNext();
     return;
+  }
+
+  if (isRetryChainError) {
+    log(`Processing retry chain error for ${workflowId} (bypassing cooldown)`);
   }
 
   processing = true;
@@ -1249,9 +1424,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "4.0.0",
+      version: "4.1.0",
       model: CLAUDE_MODEL,
-      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry"],
+      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry", "error_signature_comparison", "retry_troubleshooting"],
       maxRetries: MAX_RETRIES,
       activeRetryChains: retryChains.size,
       queueLength: queue.length,
@@ -1303,10 +1478,11 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v4.0.0");
+  log("  n8n Auto-Fix Server v4.1.0");
   log("  Model: Claude Opus 4.5 (Most Intelligent)");
   log("  Features: Comprehensive scan, pattern detection, auto-retry");
-  log("  NEW: Auto-retry after fix (max 2) to close the loop");
+  log("  NEW: Error signature comparison for retry troubleshooting");
+  log("  NEW: Cooldown bypass for retry chain errors");
   log("═══════════════════════════════════════════════════════════");
 }
 
