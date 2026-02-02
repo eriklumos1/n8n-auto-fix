@@ -23,6 +23,12 @@ const MAX_RETRIES = 2;
 // Use the most intelligent model
 const CLAUDE_MODEL = "claude-opus-4-5-20251101";
 
+// Token limits
+const MAX_TOKEN_ESTIMATE = 150000; // Stay well under 200K limit
+const MAX_STRING_LENGTH = 1000; // Truncate strings to this length
+const MAX_UPSTREAM_ITEMS = 2; // Max items per upstream node
+const MAX_UPSTREAM_NODES = 10; // Max upstream nodes to include
+
 // =============================================================================
 // STATE
 // =============================================================================
@@ -36,6 +42,137 @@ const retryChains = new Map();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// =============================================================================
+// TRUNCATION UTILITIES
+// =============================================================================
+
+/**
+ * Truncate a string to maxLength, adding ellipsis if truncated
+ */
+function truncateString(str, maxLength = MAX_STRING_LENGTH) {
+  if (typeof str !== 'string') return str;
+  if (str.length <= maxLength) return str;
+  return str.substring(0, maxLength) + '... [truncated]';
+}
+
+/**
+ * Recursively truncate all string values in an object
+ */
+function truncateObject(obj, maxStringLength = MAX_STRING_LENGTH, depth = 0) {
+  if (depth > 10) return '[max depth reached]'; // Prevent infinite recursion
+
+  if (typeof obj === 'string') {
+    return truncateString(obj, maxStringLength);
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.slice(0, 10).map(item => truncateObject(item, maxStringLength, depth + 1));
+  }
+
+  if (typeof obj === 'object' && obj !== null) {
+    const truncated = {};
+    const keys = Object.keys(obj).slice(0, 50); // Limit number of keys
+    for (const key of keys) {
+      truncated[key] = truncateObject(obj[key], maxStringLength, depth + 1);
+    }
+    if (Object.keys(obj).length > 50) {
+      truncated['_truncated'] = `${Object.keys(obj).length - 50} more keys omitted`;
+    }
+    return truncated;
+  }
+
+  return obj;
+}
+
+/**
+ * Estimate token count (rough approximation: 1 token ≈ 4 chars)
+ */
+function estimateTokens(obj) {
+  const jsonStr = JSON.stringify(obj);
+  return Math.ceil(jsonStr.length / 4);
+}
+
+/**
+ * Truncate data to fit within token budget
+ */
+function truncateToTokenBudget(data, maxTokens = MAX_TOKEN_ESTIMATE) {
+  let current = data;
+  let tokens = estimateTokens(current);
+
+  // If already within budget, return as-is
+  if (tokens <= maxTokens) {
+    return { data: current, tokens, truncated: false };
+  }
+
+  log(`Data exceeds token budget (${tokens} > ${maxTokens}), truncating...`);
+
+  // Progressive truncation strategy
+  const strategies = [
+    // 1. Truncate upstream data more aggressively
+    () => {
+      if (current.upstreamData) {
+        const truncated = {};
+        const nodeNames = Object.keys(current.upstreamData).slice(0, 5);
+        for (const nodeName of nodeNames) {
+          const nodeData = current.upstreamData[nodeName];
+          if (Array.isArray(nodeData)) {
+            truncated[nodeName] = nodeData.slice(0, 1).map(item =>
+              truncateObject(item, 200)
+            );
+          } else {
+            truncated[nodeName] = truncateObject(nodeData, 200);
+          }
+        }
+        current = { ...current, upstreamData: truncated };
+      }
+    },
+    // 2. Remove upstream data entirely if still too large
+    () => {
+      if (current.upstreamData) {
+        current = {
+          ...current,
+          upstreamData: { _note: 'Upstream data omitted due to size constraints' }
+        };
+      }
+    },
+    // 3. Truncate failed node config
+    () => {
+      if (current.failedNodeConfig) {
+        current = {
+          ...current,
+          failedNodeConfig: truncateObject(current.failedNodeConfig, 300)
+        };
+      }
+    },
+    // 4. Keep only essential fields
+    () => {
+      current = {
+        id: current.id,
+        workflowId: current.workflowId,
+        workflowName: current.workflowName,
+        status: current.status,
+        error: truncateObject(current.error, 500),
+        failedNode: current.failedNode,
+        failedNodeType: current.failedNodeType,
+        executionPath: current.executionPath?.slice(0, 10),
+        _note: 'Data heavily truncated due to size constraints'
+      };
+    }
+  ];
+
+  for (const strategy of strategies) {
+    strategy();
+    tokens = estimateTokens(current);
+    if (tokens <= maxTokens) {
+      log(`Truncation successful: ${tokens} tokens`);
+      return { data: current, tokens, truncated: true };
+    }
+  }
+
+  log(`Warning: Could not reduce to target token count. Current: ${tokens}`);
+  return { data: current, tokens, truncated: true };
 }
 
 // =============================================================================
@@ -108,7 +245,7 @@ Returns:
 - Error message and description
 - HTTP status code if applicable
 - Failed node name and full configuration
-- Upstream node data (what was fed into the failed node)
+- Upstream node data (what was fed into the failed node) - NOTE: Large data is truncated to prevent token limits
 - Execution path showing which nodes ran`,
     input_schema: {
       type: "object",
@@ -666,10 +803,10 @@ async function handleGetExecutionDetails(executionId) {
   if (execution.data?.resultData?.error) {
     const error = execution.data.resultData.error;
     result.error = {
-      message: error.message || "Unknown error",
-      description: error.description || "",
+      message: truncateString(error.message || "Unknown error", 500),
+      description: truncateString(error.description || "", 500),
       httpCode: error.httpCode || "",
-      context: error.context || {}
+      context: truncateObject(error.context || {}, 200)
     };
 
     if (error.node) {
@@ -679,15 +816,16 @@ async function handleGetExecutionDetails(executionId) {
         name: error.node.name,
         type: error.node.type,
         typeVersion: error.node.typeVersion,
-        parameters: error.node.parameters,
+        parameters: truncateObject(error.node.parameters, MAX_STRING_LENGTH),
         credentials: error.node.credentials
       };
     }
   }
 
-  // Extract execution path and upstream data
+  // Extract execution path and upstream data (with truncation)
   if (execution.data?.resultData?.runData) {
     const runData = execution.data.resultData.runData;
+    let nodeCount = 0;
 
     for (const [nodeName, nodeRuns] of Object.entries(runData)) {
       if (nodeRuns && nodeRuns.length > 0) {
@@ -700,17 +838,31 @@ async function handleGetExecutionDetails(executionId) {
           itemCount: lastRun.data?.main?.[0]?.length || 0
         });
 
-        // Store sample data (first 2 items max)
-        if (lastRun.data?.main?.[0]) {
+        // Store sample data (truncated) - limit number of upstream nodes
+        if (lastRun.data?.main?.[0] && nodeCount < MAX_UPSTREAM_NODES) {
           result.upstreamData[nodeName] = lastRun.data.main[0]
-            .slice(0, 2)
-            .map(item => item.json);
+            .slice(0, MAX_UPSTREAM_ITEMS)
+            .map(item => truncateObject(item.json, MAX_STRING_LENGTH));
+          nodeCount++;
         }
       }
     }
   }
 
-  return result;
+  // Apply token budget truncation
+  const { data: truncatedResult, tokens, truncated } = truncateToTokenBudget(result);
+
+  if (truncated) {
+    truncatedResult._tokenInfo = {
+      estimatedTokens: tokens,
+      truncationApplied: true,
+      note: "Large data was truncated to fit within token limits"
+    };
+  }
+
+  log(`Execution details fetched: ~${tokens} tokens${truncated ? ' (truncated)' : ''}`);
+
+  return truncatedResult;
 }
 
 async function handleGetWorkflow(workflowId) {
@@ -728,23 +880,36 @@ async function handleGetWorkflow(workflowId) {
 
   const workflow = await res.json();
 
-  return {
+  // Truncate large node parameters (like Code nodes with long scripts)
+  const truncatedNodes = workflow.nodes.map(n => ({
+    id: n.id,
+    name: n.name,
+    type: n.type,
+    typeVersion: n.typeVersion,
+    parameters: truncateObject(n.parameters, 2000), // Allow longer for workflow context
+    credentials: n.credentials,
+    position: n.position,
+    disabled: n.disabled,
+    alwaysOutputData: n.alwaysOutputData
+  }));
+
+  const result = {
     id: workflow.id,
     name: workflow.name,
     active: workflow.active,
-    nodes: workflow.nodes.map(n => ({
-      id: n.id,
-      name: n.name,
-      type: n.type,
-      typeVersion: n.typeVersion,
-      parameters: n.parameters,
-      credentials: n.credentials,
-      position: n.position,
-      disabled: n.disabled,
-      alwaysOutputData: n.alwaysOutputData
-    })),
+    nodes: truncatedNodes,
     connections: workflow.connections
   };
+
+  // Check token budget
+  const tokens = estimateTokens(result);
+  log(`Workflow fetched: ~${tokens} tokens`);
+
+  if (tokens > MAX_TOKEN_ESTIMATE) {
+    log(`Warning: Workflow data is large (${tokens} tokens). Some truncation may occur in Claude's context.`);
+  }
+
+  return result;
 }
 
 async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
@@ -767,7 +932,7 @@ async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
   function searchInValue(value, path = []) {
     if (typeof value === 'string') {
       if (value.includes(pattern)) {
-        return [{ path: path.join('.'), value, matchType: 'string' }];
+        return [{ path: path.join('.'), value: truncateString(value, 200), matchType: 'string' }];
       }
       return [];
     }
@@ -801,7 +966,7 @@ async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
           location: m.path,
           currentValue: m.value
         })),
-        fullParameters: node.parameters
+        fullParameters: truncateObject(node.parameters, 1000) // Truncate for safety
       });
     }
   }
@@ -1184,7 +1349,7 @@ ${retryContext.errorComparison === "same_error"
 - **Workflow ID**: ${errorData.workflowId}
 - **Workflow Name**: ${errorData.workflowName}
 - **Failed Node**: ${errorData.failedNodeName}
-- **Error Message**: ${errorData.errorMessage}
+- **Error Message**: ${truncateString(errorData.errorMessage, 500)}
 - **Execution ID**: ${errorData.executionId}
 - **Execution URL**: ${errorData.executionUrl}
 - **Timestamp**: ${timestamp}${retryInfo}
@@ -1199,6 +1364,10 @@ Start by fetching the execution details to get full context about the error.`
   while (iteration < maxIterations) {
     iteration++;
     log(`Agent iteration ${iteration}/${maxIterations}`);
+
+    // Estimate current message size
+    const messageTokens = estimateTokens(messages);
+    log(`Current message context: ~${messageTokens} tokens`);
 
     // Call Claude Opus 4.5
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1357,7 +1526,7 @@ async function processError(errorData) {
   } catch (error) {
     log(`Agent error: ${error.message}`);
     await handleSendSlackNotification(
-      `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${errorData.errorMessage}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
+      `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${truncateString(errorData.errorMessage, 200)}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
     );
   }
 
@@ -1424,10 +1593,20 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "4.1.0",
+      version: "4.2.0",
       model: CLAUDE_MODEL,
-      features: ["comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry", "error_signature_comparison", "retry_troubleshooting"],
+      features: [
+        "comprehensive_scan",
+        "pattern_detection",
+        "multi_node_fix",
+        "auto_retry",
+        "error_signature_comparison",
+        "retry_troubleshooting",
+        "token_truncation",
+        "data_budget_management"
+      ],
       maxRetries: MAX_RETRIES,
+      maxTokenEstimate: MAX_TOKEN_ESTIMATE,
       activeRetryChains: retryChains.size,
       queueLength: queue.length,
       processing
@@ -1478,11 +1657,12 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v4.1.0");
+  log("  n8n Auto-Fix Server v4.2.0");
   log("  Model: Claude Opus 4.5 (Most Intelligent)");
   log("  Features: Comprehensive scan, pattern detection, auto-retry");
-  log("  NEW: Error signature comparison for retry troubleshooting");
-  log("  NEW: Cooldown bypass for retry chain errors");
+  log("  NEW: Token truncation & data budget management");
+  log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
+  log(`  Max String Length: ${MAX_STRING_LENGTH}`);
   log("═══════════════════════════════════════════════════════════");
 }
 
