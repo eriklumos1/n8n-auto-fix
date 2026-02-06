@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 // =============================================================================
 // CONFIGURATION
@@ -20,6 +22,13 @@ const COOLDOWN_MS = 5 * 60 * 1000;
 // Maximum retries after successful fix
 const MAX_RETRIES = 2;
 
+// Circuit breaker: stop after N consecutive failures per workflow
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_RESET_MS = 60 * 60 * 1000; // 1 hour
+
+// Batch notification delay (ms) to group simultaneous errors
+const ACK_BATCH_DELAY = 30000; // 30 seconds
+
 // Use the most intelligent model
 const CLAUDE_MODEL = "claude-opus-4-6";
 
@@ -28,6 +37,13 @@ const MAX_TOKEN_ESTIMATE = 180000; // Opus 4.6 handles full 200K context well
 const MAX_STRING_LENGTH = 1000; // Truncate strings to this length
 const MAX_UPSTREAM_ITEMS = 2; // Max items per upstream node
 const MAX_UPSTREAM_NODES = 10; // Max upstream nodes to include
+
+// Persistent storage paths
+const DATA_DIR = path.join(__dirname, "data");
+const PROCESSED_FILE = path.join(DATA_DIR, "processed-executions.json");
+const FIX_HISTORY_FILE = path.join(DATA_DIR, "fix-history.json");
+const RETRY_CHAINS_FILE = path.join(DATA_DIR, "retry-chains.json");
+const SNAPSHOTS_DIR = path.join(DATA_DIR, "snapshots");
 
 // =============================================================================
 // STATE
@@ -39,6 +55,18 @@ const lastProcessed = new Map();
 
 // Retry chain tracking: executionId -> {originalExecutionId, retryCount, workflowId, workflowName, errorSignature, fixHistory}
 const retryChains = new Map();
+
+// Execution-level dedup: Set of execution IDs already processed
+let processedExecutions = new Set();
+
+// Fix attempt memory: workflowId -> [{timestamp, executionId, errorMessage, fixAttempted, success}]
+let fixHistory = {};
+
+// Circuit breaker: workflowId -> {failures, openedAt, lastError}
+const circuitBreakers = new Map();
+
+// Batch notification accumulator: workflowId -> {count, errors[], timer}
+const pendingAcks = new Map();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -233,6 +261,158 @@ function compareErrorSignatures(prev, current) {
 }
 
 // =============================================================================
+// PERSISTENT STORAGE
+// =============================================================================
+
+function ensureDataDirs() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(SNAPSHOTS_DIR)) fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true });
+}
+
+function loadProcessedExecutions() {
+  try {
+    const data = fs.readFileSync(PROCESSED_FILE, "utf8");
+    const arr = JSON.parse(data);
+    processedExecutions = new Set(arr);
+    // Trim to last 500 entries to prevent unbounded growth
+    if (processedExecutions.size > 500) {
+      const trimmed = [...processedExecutions].slice(-500);
+      processedExecutions = new Set(trimmed);
+    }
+    log(`Loaded ${processedExecutions.size} processed execution IDs`);
+  } catch {
+    processedExecutions = new Set();
+  }
+}
+
+function saveProcessedExecutions() {
+  try {
+    fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...processedExecutions]));
+  } catch (err) {
+    log(`Failed to save processed executions: ${err.message}`);
+  }
+}
+
+function loadFixHistory() {
+  try {
+    const data = fs.readFileSync(FIX_HISTORY_FILE, "utf8");
+    fixHistory = JSON.parse(data);
+    const total = Object.values(fixHistory).reduce((sum, arr) => sum + arr.length, 0);
+    log(`Loaded fix history: ${total} entries across ${Object.keys(fixHistory).length} workflows`);
+  } catch {
+    fixHistory = {};
+  }
+}
+
+function saveFixHistory() {
+  try {
+    fs.writeFileSync(FIX_HISTORY_FILE, JSON.stringify(fixHistory, null, 2));
+  } catch (err) {
+    log(`Failed to save fix history: ${err.message}`);
+  }
+}
+
+function addFixAttempt(workflowId, entry) {
+  if (!fixHistory[workflowId]) fixHistory[workflowId] = [];
+  fixHistory[workflowId].push({ ...entry, timestamp: Date.now() });
+  // Keep last 20 attempts per workflow
+  if (fixHistory[workflowId].length > 20) {
+    fixHistory[workflowId] = fixHistory[workflowId].slice(-20);
+  }
+  saveFixHistory();
+}
+
+function loadRetryChains() {
+  try {
+    const data = JSON.parse(fs.readFileSync(RETRY_CHAINS_FILE, "utf8"));
+    for (const [k, v] of Object.entries(data)) {
+      retryChains.set(k, v);
+    }
+    log(`Loaded ${retryChains.size} retry chains`);
+  } catch {
+    // first run
+  }
+}
+
+function saveRetryChains() {
+  try {
+    const obj = Object.fromEntries(retryChains);
+    fs.writeFileSync(RETRY_CHAINS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    log(`Failed to save retry chains: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// CIRCUIT BREAKER
+// =============================================================================
+
+function isCircuitOpen(workflowId) {
+  const cb = circuitBreakers.get(workflowId);
+  if (!cb) return false;
+  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+    // Auto-reset after timeout
+    if (Date.now() - cb.openedAt > CIRCUIT_BREAKER_RESET_MS) {
+      circuitBreakers.delete(workflowId);
+      log(`Circuit breaker reset for ${workflowId}`);
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function recordCircuitFailure(workflowId, errorMessage) {
+  const cb = circuitBreakers.get(workflowId) || { failures: 0, openedAt: null, lastError: "" };
+  cb.failures++;
+  cb.lastError = errorMessage;
+  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD && !cb.openedAt) {
+    cb.openedAt = Date.now();
+  }
+  circuitBreakers.set(workflowId, cb);
+  return cb.failures >= CIRCUIT_BREAKER_THRESHOLD;
+}
+
+function resetCircuitBreaker(workflowId) {
+  circuitBreakers.delete(workflowId);
+}
+
+// =============================================================================
+// ERROR PRE-CLASSIFICATION
+// =============================================================================
+
+function classifyError(errorData) {
+  const msg = (errorData.errorMessage || "").toLowerCase();
+
+  // Infrastructure errors — never auto-fixable
+  if (msg.includes("out-of-memory") || msg.includes("out of memory") || msg.includes("possible out-of-memory"))
+    return { fixable: false, category: "infrastructure", reason: "Server OOM — check Render instance memory" };
+  if (msg.includes("gateway timed out") || msg.includes("502 bad gateway"))
+    return { fixable: false, category: "infrastructure", reason: "Gateway timeout — n8n instance may be overloaded" };
+
+  // Credential errors — never auto-fixable
+  if (msg.includes("authorization failed") || msg.includes("please check your credentials"))
+    return { fixable: false, category: "credentials", reason: "Invalid or expired API credentials" };
+
+  // External service errors — not auto-fixable
+  if (msg.includes("connection terminated due to connection timeout"))
+    return { fixable: false, category: "external_service", reason: "External service timeout — not a workflow config issue" };
+
+  // Likely auto-fixable
+  if (msg.includes("unknown field name"))
+    return { fixable: true, category: "airtable_field" };
+  if (msg.includes("cannot read properties"))
+    return { fixable: true, category: "expression_error" };
+  if (msg.includes("could not find property option"))
+    return { fixable: true, category: "switch_node" };
+  if (msg.includes("your request is invalid"))
+    return { fixable: true, category: "airtable_request" };
+
+  // Unknown — let the agent analyze
+  return { fixable: null, category: "unknown" };
+}
+
+// =============================================================================
 // TOOL DEFINITIONS
 // =============================================================================
 
@@ -307,11 +487,15 @@ Returns all nodes that contain the pattern, so you can fix them ALL.`,
   },
   {
     name: "update_node",
-    description: `Update a specific node's parameters and/or top-level properties in the workflow.
+    description: `Update a specific node's parameters and/or top-level options in the workflow.
 
 IMPORTANT: Only updates the specified node - all other nodes remain unchanged.
-The parameters object should be the COMPLETE new parameters for the node.
-Use node_options to set top-level node properties like alwaysOutputData, continueOnFail, retryOnFail.`,
+
+Two update modes:
+1. **parameters** — The COMPLETE new parameters object for the node (replaces all parameters)
+2. **node_options** — Top-level node properties like alwaysOutputData, continueOnFail, retryOnFail, maxTries, waitBetweenTries. These are set OUTSIDE the parameters object on the node itself.
+
+You can provide parameters, node_options, or both in a single call.`,
     input_schema: {
       type: "object",
       properties: {
@@ -325,17 +509,20 @@ Use node_options to set top-level node properties like alwaysOutputData, continu
         },
         parameters: {
           type: "object",
-          description: "The complete new parameters object for the node"
+          description: "The complete new parameters object for the node (optional if only updating node_options)"
         },
         node_options: {
           type: "object",
-          description: "Optional top-level node properties to set (outside of parameters)",
+          description: "Top-level node properties to set. Valid keys: alwaysOutputData, continueOnFail, retryOnFail, maxTries, waitBetweenTries, onError, executeOnce, disabled",
           properties: {
-            alwaysOutputData: { type: "boolean", description: "Output an empty item when node returns no results" },
-            continueOnFail: { type: "boolean", description: "Continue workflow execution when this node fails" },
-            retryOnFail: { type: "boolean", description: "Retry the node on failure" },
-            maxTries: { type: "number", description: "Max retry attempts (requires retryOnFail: true)" },
-            waitBetweenTries: { type: "number", description: "Milliseconds to wait between retries" }
+            alwaysOutputData: { type: "boolean" },
+            continueOnFail: { type: "boolean" },
+            retryOnFail: { type: "boolean" },
+            maxTries: { type: "number" },
+            waitBetweenTries: { type: "number" },
+            onError: { type: "string" },
+            executeOnce: { type: "boolean" },
+            disabled: { type: "boolean" }
           }
         }
       },
@@ -405,6 +592,25 @@ Returns the new execution ID if successful.`,
     }
   },
   {
+    name: "rollback_workflow",
+    description: `Revert a workflow to its state before the most recent auto-fix attempt. Use this when:
+- A fix made things worse
+- The retry after a fix still fails with the same or a new error
+- You realize the fix was incorrect
+
+This restores the workflow from the snapshot taken before the last update_node call.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        workflow_id: {
+          type: "string",
+          description: "The workflow ID to rollback"
+        }
+      },
+      required: ["workflow_id"]
+    }
+  },
+  {
     name: "complete",
     description: "Call this when finished. Indicate whether the fix was successful and provide a summary.",
     input_schema: {
@@ -417,6 +623,10 @@ Returns the new execution ID if successful.`,
         summary: {
           type: "string",
           description: "Brief summary of what was done"
+        },
+        fix_description: {
+          type: "string",
+          description: "Concise description of what fix was applied (e.g., 'Changed Airtable operation Search to search in 5 nodes'). Used for tracking fix history to avoid repeating failed fixes."
         }
       },
       required: ["success", "summary"]
@@ -432,19 +642,32 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 
 ## Your Process (COMPREHENSIVE FIX + RETRY)
 1. ALWAYS start by calling get_execution_details to understand the full error context
-2. Analyze the error type and determine if it's auto-fixable
-3. **CRITICAL: If the error involves a pattern (expression, field reference, node reference):**
+2. **CHECK FIX HISTORY** (provided in the error info) — if previous attempts are listed, DO NOT repeat fixes that already failed. Try a completely different approach or classify as not auto-fixable.
+3. Analyze the error type and determine if it's auto-fixable
+4. **CRITICAL: If the error involves a pattern (expression, field reference, node reference):**
    a. Call scan_workflow_for_pattern to find ALL nodes with the same problematic pattern
    b. This prevents partial fixes where only the failing node gets fixed
-4. Fix ALL affected nodes, not just the immediately failing one
-5. Validate with validate_workflow after ALL fixes are applied
-6. Send a Slack notification with complete results (list ALL nodes fixed)
-7. **RETRY STEP (if fix was successful):**
+5. Fix ALL affected nodes, not just the immediately failing one
+6. Validate with validate_workflow after ALL fixes are applied
+7. Send a Slack notification with complete results (list ALL nodes fixed)
+8. **RETRY STEP (if fix was successful):**
    - Check the retry_context in the error info
    - If retryCount < 2 (max retries), call retry_execution to verify the fix works
    - If retryCount >= 2, DO NOT retry - send "max retries reached" notification instead
    - The retry will automatically re-run the workflow; if it fails again, you'll get a new error
-8. Call complete() when done
+9. Call complete() with fix_description so it's recorded in history
+10. **If your fix fails on retry**: Use rollback_workflow to revert your changes before trying something else
+
+## Fix History Rules (CRITICAL)
+- The error info includes a "Previous Fix Attempts" section showing what was already tried
+- If a fix was already attempted and FAILED, DO NOT try the same fix again
+- If 3+ different fixes have already failed for the same error pattern, classify as NOT auto-fixable
+- Always provide a fix_description when calling complete() so future attempts know what was tried
+
+## Rollback Rules
+- If you apply a fix and the retry still fails with the SAME error, use rollback_workflow to undo your changes
+- This prevents stacking bad fixes on top of each other
+- After rolling back, try a different approach or classify as not auto-fixable
 
 ## Retry Rules (IMPORTANT)
 - After a SUCCESSFUL fix + validation, you SHOULD call retry_execution to close the loop
@@ -1024,7 +1247,7 @@ async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
   };
 }
 
-async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions = {}) {
+async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions) {
   log(`Updating node "${nodeName}" in workflow ${workflowId}...`);
 
   // Fetch current workflow
@@ -1039,6 +1262,21 @@ async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions
 
   const workflow = await getRes.json();
 
+  // Save snapshot before modifying (for rollback)
+  try {
+    const snapshotFile = path.join(SNAPSHOTS_DIR, `${workflowId}-${Date.now()}.json`);
+    fs.writeFileSync(snapshotFile, JSON.stringify(workflow, null, 2));
+    log(`Snapshot saved: ${snapshotFile}`);
+  } catch (err) {
+    log(`Warning: Failed to save snapshot: ${err.message}`);
+  }
+
+  // Allowed top-level node options
+  const ALLOWED_NODE_OPTIONS = [
+    "alwaysOutputData", "continueOnFail", "retryOnFail",
+    "maxTries", "waitBetweenTries", "onError", "executeOnce", "disabled"
+  ];
+
   // Find and update the specific node
   let nodeFound = false;
   const updatedNodes = workflow.nodes.map(node => {
@@ -1049,12 +1287,14 @@ async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions
       if (newParameters) {
         updated.parameters = newParameters;
       }
-      // Apply top-level node options
-      if (nodeOptions.alwaysOutputData !== undefined) updated.alwaysOutputData = nodeOptions.alwaysOutputData;
-      if (nodeOptions.continueOnFail !== undefined) updated.continueOnFail = nodeOptions.continueOnFail;
-      if (nodeOptions.retryOnFail !== undefined) updated.retryOnFail = nodeOptions.retryOnFail;
-      if (nodeOptions.maxTries !== undefined) updated.maxTries = nodeOptions.maxTries;
-      if (nodeOptions.waitBetweenTries !== undefined) updated.waitBetweenTries = nodeOptions.waitBetweenTries;
+      // Apply node-level options if provided
+      if (nodeOptions) {
+        for (const key of ALLOWED_NODE_OPTIONS) {
+          if (nodeOptions[key] !== undefined) {
+            updated[key] = nodeOptions[key];
+          }
+        }
+      }
       return updated;
     }
     return node;
@@ -1248,7 +1488,7 @@ async function handleRetryExecution(executionId, workflowId, workflowName, fixSu
   // Create error signature for tracking
   const currentErrorSignature = chainInfo?.errorSignature || null;
 
-  // Track the new execution in the retry chain
+  // Track the new execution in the retry chain (and persist)
   retryChains.set(newExecutionId, {
     originalExecutionId,
     retryCount: newRetryCount,
@@ -1259,6 +1499,7 @@ async function handleRetryExecution(executionId, workflowId, workflowName, fixSu
     fixHistory: newFixHistory,
     timestamp: Date.now()
   });
+  saveRetryChains();
 
   // Build execution URL
   const executionUrl = `${N8N_API_URL}/workflow/${workflowId}/executions/${newExecutionId}`;
@@ -1285,6 +1526,90 @@ _Retrying to verify the fix works..._`;
   };
 }
 
+async function handleRollbackWorkflow(workflowId) {
+  log(`Rolling back workflow ${workflowId}...`);
+
+  // Find the most recent snapshot for this workflow
+  const files = fs.readdirSync(SNAPSHOTS_DIR)
+    .filter(f => f.startsWith(`${workflowId}-`) && f.endsWith(".json"))
+    .sort()
+    .reverse();
+
+  if (files.length === 0) {
+    throw new Error(`No snapshots found for workflow ${workflowId}`);
+  }
+
+  const snapshotFile = path.join(SNAPSHOTS_DIR, files[0]);
+  const workflow = JSON.parse(fs.readFileSync(snapshotFile, "utf8"));
+
+  // Clean nodes for API
+  const cleanNodes = workflow.nodes.map(node => {
+    const clean = {
+      id: node.id,
+      name: node.name,
+      type: node.type,
+      typeVersion: node.typeVersion,
+      position: node.position,
+      parameters: node.parameters || {}
+    };
+    if (node.credentials) clean.credentials = node.credentials;
+    if (node.disabled) clean.disabled = node.disabled;
+    if (node.onError) clean.onError = node.onError;
+    if (node.continueOnFail) clean.continueOnFail = node.continueOnFail;
+    if (node.retryOnFail) clean.retryOnFail = node.retryOnFail;
+    if (node.maxTries) clean.maxTries = node.maxTries;
+    if (node.waitBetweenTries) clean.waitBetweenTries = node.waitBetweenTries;
+    if (node.executeOnce) clean.executeOnce = node.executeOnce;
+    if (node.alwaysOutputData) clean.alwaysOutputData = node.alwaysOutputData;
+    return clean;
+  });
+
+  // Clean settings
+  const cleanSettings = {};
+  const allowedSettings = [
+    "executionOrder", "timezone", "errorWorkflow",
+    "saveDataErrorExecution", "saveDataSuccessExecution",
+    "saveExecutionProgress", "saveManualExecutions", "executionTimeout"
+  ];
+  if (workflow.settings) {
+    for (const key of allowedSettings) {
+      if (workflow.settings[key] !== undefined) {
+        cleanSettings[key] = workflow.settings[key];
+      }
+    }
+  }
+
+  // Restore the workflow
+  const url = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-N8N-API-KEY": N8N_API_KEY
+    },
+    body: JSON.stringify({
+      name: workflow.name,
+      nodes: cleanNodes,
+      connections: workflow.connections,
+      settings: cleanSettings
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to rollback workflow: ${res.status} - ${text}`);
+  }
+
+  // Remove used snapshot
+  fs.unlinkSync(snapshotFile);
+
+  return {
+    success: true,
+    message: `Rolled back workflow "${workflow.name}" to snapshot from ${files[0]}`,
+    snapshotUsed: files[0]
+  };
+}
+
 async function executeTool(toolName, toolInput) {
   log(`Executing tool: ${toolName}`);
 
@@ -1307,8 +1632,8 @@ async function executeTool(toolName, toolInput) {
         return await handleUpdateNode(
           toolInput.workflow_id,
           toolInput.node_name,
-          toolInput.parameters,
-          toolInput.node_options
+          toolInput.parameters || null,
+          toolInput.node_options || null
         );
 
       case "validate_workflow":
@@ -1325,11 +1650,15 @@ async function executeTool(toolName, toolInput) {
           toolInput.fix_summary
         );
 
+      case "rollback_workflow":
+        return await handleRollbackWorkflow(toolInput.workflow_id);
+
       case "complete":
         return {
           done: true,
           success: toolInput.success,
-          summary: toolInput.summary
+          summary: toolInput.summary,
+          fix_description: toolInput.fix_description || ""
         };
 
       default:
@@ -1390,6 +1719,20 @@ ${retryContext.errorComparison === "same_error"
 - **After fixing**: Call retry_execution to verify the fix works`;
   }
 
+  // Build fix history context from persistent storage
+  const history = fixHistory[errorData.workflowId] || [];
+  const recentHistory = history.slice(-5);
+  let historyContext = "";
+  if (recentHistory.length > 0) {
+    historyContext = `\n\n## Previous Fix Attempts (IMPORTANT — DO NOT REPEAT FAILED FIXES)\n`;
+    for (const h of recentHistory) {
+      const time = new Date(h.timestamp).toISOString();
+      const status = h.success ? "SUCCESS" : "FAILED";
+      historyContext += `- ${time}: "${h.fixAttempted}" → ${status} (error: ${h.errorMessage || "N/A"})\n`;
+    }
+    historyContext += `\nDo NOT try the same fix that already failed. Try a different approach or classify as not auto-fixable.\n`;
+  }
+
   const messages = [
     {
       role: "user",
@@ -1402,7 +1745,7 @@ ${retryContext.errorComparison === "same_error"
 - **Error Message**: ${truncateString(errorData.errorMessage, 500)}
 - **Execution ID**: ${errorData.executionId}
 - **Execution URL**: ${errorData.executionUrl}
-- **Timestamp**: ${timestamp}${retryInfo}
+- **Timestamp**: ${timestamp}${retryInfo}${historyContext}
 
 Start by fetching the execution details to get full context about the error.`
     }
@@ -1410,6 +1753,7 @@ Start by fetching the execution details to get full context about the error.`
 
   const maxIterations = 15; // Allow more iterations for complex fixes
   let iteration = 0;
+  let agentResult = { success: false, summary: "", fix_description: "" };
 
   while (iteration < maxIterations) {
     iteration++;
@@ -1476,6 +1820,11 @@ Start by fetching the execution details to get full context about the error.`
 
         if (toolResult.done) {
           shouldStop = true;
+          agentResult = {
+            success: toolResult.success || false,
+            summary: toolResult.summary || "",
+            fix_description: toolResult.fix_description || ""
+          };
           log(`Agent completed: ${toolResult.summary}`);
         }
 
@@ -1511,6 +1860,8 @@ Start by fetching the execution details to get full context about the error.`
       `:warning: *Auto-Fix Timeout*\n\nWorkflow: ${errorData.workflowName}\nExecution: ${errorData.executionId}\n\nThe auto-fix agent reached maximum iterations without completing.\n\n_Manual investigation required._`
     );
   }
+
+  return agentResult;
 }
 
 // =============================================================================
@@ -1531,7 +1882,37 @@ async function processError(errorData) {
     return;
   }
 
-  // Check if this execution is part of a retry chain
+  // Mark execution as processed (dedup)
+  processedExecutions.add(executionId);
+  saveProcessedExecutions();
+
+  // Check circuit breaker
+  if (isCircuitOpen(workflowId)) {
+    log(`Circuit breaker OPEN for ${workflowName} — silently dropping`);
+    return;
+  }
+
+  // Pre-classify error
+  const classification = classifyError(errorData);
+  if (classification.fixable === false) {
+    log(`Error pre-classified as not fixable: ${classification.category} — ${classification.reason}`);
+
+    // Record in circuit breaker
+    const tripped = recordCircuitFailure(workflowId, errorData.errorMessage);
+
+    if (tripped) {
+      await handleSendSlackNotification(
+        `:no_entry: *Circuit Breaker Opened: ${workflowName}*\n\nThis workflow has failed ${CIRCUIT_BREAKER_THRESHOLD} consecutive times with auto-fix unable to resolve.\nSuppressing further notifications for 1 hour.\n\n*Last error:* ${errorData.errorMessage}\n*Category:* ${classification.category}\n*Reason:* ${classification.reason}\n\n_Manual investigation required._`
+      );
+    } else {
+      await handleSendSlackNotification(
+        `:rotating_light: *${classification.category}: ${workflowName}*\n\n*Error:* ${errorData.errorMessage}\n*Failed Node:* ${errorData.failedNodeName}\n*Reason:* ${classification.reason}\n\n_Not auto-fixable. Manual action required._`
+      );
+    }
+    return;
+  }
+
+  // Check if this execution is part of a retry chain — compare error signatures
   let retryContext = retryChains.get(executionId);
 
   if (retryContext) {
@@ -1554,8 +1935,6 @@ async function processError(errorData) {
     // First failure - create initial error signature for future comparison
     const initialSignature = createErrorSignature(errorData);
 
-    // Store in a temporary map for when retry comes back
-    // We'll create the full chain entry when retry_execution is called
     retryChains.set(executionId, {
       originalExecutionId: executionId,
       retryCount: 0,
@@ -1565,14 +1944,22 @@ async function processError(errorData) {
       fixHistory: [],
       timestamp: Date.now()
     });
+    saveRetryChains();
 
     log(`Original failure - created error signature: ${initialSignature.node}/${initialSignature.errorType}`);
   }
 
   log(`Starting agent for: ${workflowName} (${workflowId})${retryContext ? ` [Retry ${retryContext.retryCount}/${MAX_RETRIES}]` : ''}`);
 
+  let agentSuccess = false;
+  let agentFixDescription = "";
+
   try {
-    await runAgentLoop(errorData, retryContext);
+    const result = await runAgentLoop(errorData, retryContext);
+    if (result) {
+      agentSuccess = result.success || false;
+      agentFixDescription = result.fix_description || result.summary || "";
+    }
   } catch (error) {
     log(`Agent error: ${error.message}`);
     await handleSendSlackNotification(
@@ -1580,13 +1967,31 @@ async function processError(errorData) {
     );
   }
 
+  // Record fix attempt in history
+  addFixAttempt(workflowId, {
+    executionId,
+    errorMessage: errorData.errorMessage,
+    fixAttempted: agentFixDescription || "Agent analyzed but no fix applied",
+    success: agentSuccess
+  });
+
+  // Update circuit breaker
+  if (agentSuccess) {
+    resetCircuitBreaker(workflowId);
+  } else {
+    recordCircuitFailure(workflowId, errorData.errorMessage);
+  }
+
   // Clean up old retry chain entries (older than 1 hour) to prevent memory leaks
   const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  let chainsModified = false;
   for (const [execId, chain] of retryChains.entries()) {
     if (chain.timestamp && chain.timestamp < oneHourAgo) {
       retryChains.delete(execId);
+      chainsModified = true;
     }
   }
+  if (chainsModified) saveRetryChains();
 }
 
 // =============================================================================
@@ -1605,6 +2010,20 @@ async function processNext() {
   const errorData = queue.shift();
   const workflowId = errorData.workflowId;
   const executionId = errorData.executionId;
+
+  // Execution-level dedup: skip if already processed
+  if (processedExecutions.has(executionId)) {
+    log(`Skipping already-processed execution ${executionId}`);
+    processNext();
+    return;
+  }
+
+  // Circuit breaker: skip if circuit is open for this workflow
+  if (isCircuitOpen(workflowId)) {
+    log(`Skipping ${workflowId} - circuit breaker OPEN`);
+    processNext();
+    return;
+  }
 
   // Check if this execution is part of a retry chain BEFORE checking cooldown
   const isRetryChainError = retryChains.has(executionId);
@@ -1634,6 +2053,38 @@ async function processNext() {
 }
 
 // =============================================================================
+// BATCH NOTIFICATION SUPPRESSION
+// =============================================================================
+
+function queueAcknowledgment(errorData) {
+  const key = errorData.workflowId;
+  if (!pendingAcks.has(key)) {
+    pendingAcks.set(key, { count: 0, errors: [], workflowName: errorData.workflowName, timer: null });
+    const timer = setTimeout(() => flushAcks(key), ACK_BATCH_DELAY);
+    pendingAcks.get(key).timer = timer;
+  }
+  const ack = pendingAcks.get(key);
+  ack.count++;
+  ack.errors.push(errorData.executionId);
+}
+
+async function flushAcks(workflowId) {
+  const ack = pendingAcks.get(workflowId);
+  if (!ack) return;
+  pendingAcks.delete(workflowId);
+
+  if (ack.count === 1) {
+    await handleSendSlackNotification(
+      `:gear: *Auto-Fix Server Received Error*\n\nWorkflow: ${ack.workflowName}\nExecution: ${ack.errors[0]}\n\n_Processing..._`
+    );
+  } else {
+    await handleSendSlackNotification(
+      `:gear: *Auto-Fix Server Received ${ack.count} Errors*\n\nWorkflow: ${ack.workflowName}\nExecutions: ${ack.errors.slice(0, 5).join(", ")}${ack.count > 5 ? ` (+${ack.count - 5} more)` : ""}\n\n_Processing most recent error. ${ack.count - 1} duplicates will be skipped._`
+    );
+  }
+}
+
+// =============================================================================
 // HTTP SERVER
 // =============================================================================
 
@@ -1646,21 +2097,21 @@ const server = http.createServer((req, res) => {
       version: "5.0.0",
       model: CLAUDE_MODEL,
       features: [
-        "comprehensive_scan",
-        "pattern_detection",
-        "multi_node_fix",
-        "auto_retry",
-        "error_signature_comparison",
-        "retry_troubleshooting",
-        "token_truncation",
-        "data_budget_management",
-        "always_output_data_fix",
-        "stale_json_detection",
-        "node_options_support"
+        "comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry",
+        "error_signature_comparison", "retry_troubleshooting",
+        "token_truncation", "data_budget_management",
+        "always_output_data_fix", "stale_json_detection", "node_options_support",
+        "execution_dedup", "fix_memory", "circuit_breaker", "error_classification",
+        "workflow_snapshots", "rollback", "batch_notifications"
       ],
       maxRetries: MAX_RETRIES,
       maxTokenEstimate: MAX_TOKEN_ESTIMATE,
+      circuitBreakerThreshold: CIRCUIT_BREAKER_THRESHOLD,
       activeRetryChains: retryChains.size,
+      processedExecutions: processedExecutions.size,
+      openCircuitBreakers: [...circuitBreakers.entries()]
+        .filter(([, cb]) => cb.failures >= CIRCUIT_BREAKER_THRESHOLD)
+        .map(([id]) => id),
       queueLength: queue.length,
       processing
     }));
@@ -1674,9 +2125,27 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       try {
         const errorData = JSON.parse(body);
-        log(`Received error for: ${errorData.workflowName || "unknown"}`);
+        const executionId = errorData.executionId;
+        log(`Received error for: ${errorData.workflowName || "unknown"} (exec: ${executionId})`);
+
+        // Execution-level dedup at the gate
+        if (processedExecutions.has(executionId)) {
+          log(`Dropping already-processed execution ${executionId}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ queued: false, reason: "already_processed" }));
+          return;
+        }
+
+        // Circuit breaker check at the gate
+        if (isCircuitOpen(errorData.workflowId)) {
+          log(`Dropping error for ${errorData.workflowName} - circuit breaker OPEN`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ queued: false, reason: "circuit_breaker_open" }));
+          return;
+        }
 
         queue.push(errorData);
+        queueAcknowledgment(errorData);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ queued: true, position: queue.length }));
         processNext();
@@ -1713,13 +2182,19 @@ function checkConfig() {
   log("  n8n Auto-Fix Server v5.0.0");
   log("  Model: Claude Opus 4.6 (Most Intelligent)");
   log("  Features: Comprehensive scan, pattern detection, auto-retry");
-  log("  NEW: alwaysOutputData fix, stale $json detection, node_options");
+  log("  NEW: Fix memory, circuit breaker, execution dedup, rollback");
   log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
   log(`  Max String Length: ${MAX_STRING_LENGTH}`);
   log("═══════════════════════════════════════════════════════════");
 }
 
+// Initialize persistent storage and load state
+ensureDataDirs();
+loadProcessedExecutions();
+loadFixHistory();
+loadRetryChains();
 checkConfig();
+
 server.listen(PORT, () => {
   log(`Server listening on port ${PORT}`);
 });
