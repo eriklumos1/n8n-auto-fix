@@ -21,10 +21,10 @@ const COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_RETRIES = 2;
 
 // Use the most intelligent model
-const CLAUDE_MODEL = "claude-opus-4-5-20251101";
+const CLAUDE_MODEL = "claude-opus-4-6";
 
 // Token limits
-const MAX_TOKEN_ESTIMATE = 150000; // Stay well under 200K limit
+const MAX_TOKEN_ESTIMATE = 180000; // Opus 4.6 handles full 200K context well
 const MAX_STRING_LENGTH = 1000; // Truncate strings to this length
 const MAX_UPSTREAM_ITEMS = 2; // Max items per upstream node
 const MAX_UPSTREAM_NODES = 10; // Max upstream nodes to include
@@ -307,10 +307,11 @@ Returns all nodes that contain the pattern, so you can fix them ALL.`,
   },
   {
     name: "update_node",
-    description: `Update a specific node's parameters in the workflow. Use this to fix node configurations.
+    description: `Update a specific node's parameters and/or top-level properties in the workflow.
 
-IMPORTANT: Only updates the specified node's parameters - all other nodes remain unchanged.
-The parameters object should be the COMPLETE new parameters for the node.`,
+IMPORTANT: Only updates the specified node - all other nodes remain unchanged.
+The parameters object should be the COMPLETE new parameters for the node.
+Use node_options to set top-level node properties like alwaysOutputData, continueOnFail, retryOnFail.`,
     input_schema: {
       type: "object",
       properties: {
@@ -325,9 +326,20 @@ The parameters object should be the COMPLETE new parameters for the node.`,
         parameters: {
           type: "object",
           description: "The complete new parameters object for the node"
+        },
+        node_options: {
+          type: "object",
+          description: "Optional top-level node properties to set (outside of parameters)",
+          properties: {
+            alwaysOutputData: { type: "boolean", description: "Output an empty item when node returns no results" },
+            continueOnFail: { type: "boolean", description: "Continue workflow execution when this node fails" },
+            retryOnFail: { type: "boolean", description: "Retry the node on failure" },
+            maxTries: { type: "number", description: "Max retry attempts (requires retryOnFail: true)" },
+            waitBetweenTries: { type: "number", description: "Milliseconds to wait between retries" }
+          }
         }
       },
-      required: ["workflow_id", "node_name", "parameters"]
+      required: ["workflow_id", "node_name"]
     }
   },
   {
@@ -416,7 +428,7 @@ Returns the new execution ID if successful.`,
 // EXPERT KNOWLEDGE SYSTEM PROMPT
 // =============================================================================
 
-const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.5, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
+const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.6, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
 
 ## Your Process (COMPREHENSIVE FIX + RETRY)
 1. ALWAYS start by calling get_execution_details to understand the full error context
@@ -527,6 +539,32 @@ The Switch node v3.4 has a specific structure. Fix:
 ### IF Node Operator Errors
 - Wrong: operator.operation: "isNotEmpty" with singleValue: true
 - Correct: operator.operation: "notEmpty" (no singleValue needed)
+
+### Zero-Output Nodes (alwaysOutputData fix)
+When a search, filter, or lookup node returns 0 results, n8n outputs 0 items and ALL downstream nodes are silently skipped. This is the #1 cause of "workflow didn't complete" bugs for new/first-time data.
+
+Symptoms: Execution shows "success" but only 2-3 nodes ran out of many. The node before the stop point shows itemsOutput: 0.
+
+Fix: Set alwaysOutputData: true on the node (this is a TOP-LEVEL node property, NOT inside parameters). This makes it output one empty item {} instead of nothing, allowing downstream IF/Switch nodes to evaluate and route properly.
+
+Use the update_node tool with node_options: { alwaysOutputData: true } to set this property.
+
+Common nodes that need this:
+- Airtable Search operations that may return no results (dedup checks, lookups)
+- HTTP Request nodes that may return empty responses
+- Filter nodes that may filter out all items
+- Code nodes that conditionally return empty arrays
+
+IMPORTANT: When adding alwaysOutputData, verify that the NEXT node properly handles the empty item (e.g., an IF node checking if $json.id is empty).
+
+### Stale $json References (Wrong Data Source)
+When nodes are inserted between a trigger and a downstream node, expressions using $json.field break because $json only contains data from the IMMEDIATELY PREVIOUS node.
+
+Symptoms: Fields return undefined even though the trigger clearly has the data. The expression works in isolation but fails in the workflow.
+
+Fix: Replace $json.field with $('Source Node Name').item.json.field to reference the original data source directly. Use scan_workflow_for_pattern to find ALL nodes with the same stale pattern.
+
+Example: A node using $json.data.object.customer_name after an Airtable node will get undefined because $json now contains the Airtable record, not the Stripe trigger data. Fix: $('Stripe Trigger').item.json.data.object.customer_name
 
 ## NOT Auto-Fixable (Notify Only)
 - 401/403: Authentication/credential failures
@@ -656,7 +694,7 @@ ALWAYS ensure otherOptions.includeLinkToWorkflow: false
 This prevents "Automate with n8n" footers in messages.
 
 ### Common Model IDs
-- Claude Opus 4.5: claude-opus-4-5-20251101
+- Claude Opus 4.6: claude-opus-4-6
 - Claude Sonnet 4.5: claude-sonnet-4-5-20250929
 - GPT-5.2: gpt-5.2
 
@@ -695,7 +733,7 @@ For FIXED errors (SINGLE NODE):
 *Fix Applied:* {specific description of what was changed}
 *Validation:* Passed
 
-_Auto-fixed by Claude Opus 4.5 at {timestamp}_\`
+_Auto-fixed by Claude Opus 4.6 at {timestamp}_\`
 
 For FIXED errors (MULTIPLE NODES - use this when scan found related issues):
 \`:white_check_mark: *Auto-Fixed: {workflow_name}* (Comprehensive)
@@ -712,7 +750,7 @@ For FIXED errors (MULTIPLE NODES - use this when scan found related issues):
 *Pattern Scan:* Found {N} nodes with same issue - all fixed
 *Validation:* Passed
 
-_Comprehensively fixed by Claude Opus 4.5 at {timestamp}_\`
+_Comprehensively fixed by Claude Opus 4.6 at {timestamp}_\`
 
 For NOT FIXABLE errors:
 \`:rotating_light: *Action Required: {workflow_name}*
@@ -728,7 +766,7 @@ For NOT FIXABLE errors:
 2. {step 2}
 3. {step 3}
 
-_Analyzed by Claude Opus 4.5 at {timestamp}_\`
+_Analyzed by Claude Opus 4.6 at {timestamp}_\`
 
 For MAX RETRIES REACHED (when retryCount >= 2 and still failing):
 \`:stop_sign: *Max Retries Reached: {workflow_name}*
@@ -762,7 +800,7 @@ For RETRY FAILURE with SAME ERROR (fix didn't work):
 
 *New Approach:* {what you're trying differently}
 
-_Troubleshooting by Claude Opus 4.5..._\``;
+_Troubleshooting by Claude Opus 4.6..._\``;
 
 // =============================================================================
 // TOOL HANDLERS
@@ -986,7 +1024,7 @@ async function handleScanWorkflowForPattern(workflowId, pattern, patternType) {
   };
 }
 
-async function handleUpdateNode(workflowId, nodeName, newParameters) {
+async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions = {}) {
   log(`Updating node "${nodeName}" in workflow ${workflowId}...`);
 
   // Fetch current workflow
@@ -1006,7 +1044,18 @@ async function handleUpdateNode(workflowId, nodeName, newParameters) {
   const updatedNodes = workflow.nodes.map(node => {
     if (node.name === nodeName) {
       nodeFound = true;
-      return { ...node, parameters: newParameters };
+      const updated = { ...node };
+      // Update parameters if provided
+      if (newParameters) {
+        updated.parameters = newParameters;
+      }
+      // Apply top-level node options
+      if (nodeOptions.alwaysOutputData !== undefined) updated.alwaysOutputData = nodeOptions.alwaysOutputData;
+      if (nodeOptions.continueOnFail !== undefined) updated.continueOnFail = nodeOptions.continueOnFail;
+      if (nodeOptions.retryOnFail !== undefined) updated.retryOnFail = nodeOptions.retryOnFail;
+      if (nodeOptions.maxTries !== undefined) updated.maxTries = nodeOptions.maxTries;
+      if (nodeOptions.waitBetweenTries !== undefined) updated.waitBetweenTries = nodeOptions.waitBetweenTries;
+      return updated;
     }
     return node;
   });
@@ -1258,7 +1307,8 @@ async function executeTool(toolName, toolInput) {
         return await handleUpdateNode(
           toolInput.workflow_id,
           toolInput.node_name,
-          toolInput.parameters
+          toolInput.parameters,
+          toolInput.node_options
         );
 
       case "validate_workflow":
@@ -1369,7 +1419,7 @@ Start by fetching the execution details to get full context about the error.`
     const messageTokens = estimateTokens(messages);
     log(`Current message context: ~${messageTokens} tokens`);
 
-    // Call Claude Opus 4.5
+    // Call Claude Opus 4.6
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -1379,7 +1429,7 @@ Start by fetching the execution details to get full context about the error.`
       },
       body: JSON.stringify({
         model: CLAUDE_MODEL,
-        max_tokens: 8192,
+        max_tokens: 16384,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
         messages: messages
@@ -1593,7 +1643,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "4.2.0",
+      version: "5.0.0",
       model: CLAUDE_MODEL,
       features: [
         "comprehensive_scan",
@@ -1603,7 +1653,10 @@ const server = http.createServer((req, res) => {
         "error_signature_comparison",
         "retry_troubleshooting",
         "token_truncation",
-        "data_budget_management"
+        "data_budget_management",
+        "always_output_data_fix",
+        "stale_json_detection",
+        "node_options_support"
       ],
       maxRetries: MAX_RETRIES,
       maxTokenEstimate: MAX_TOKEN_ESTIMATE,
@@ -1657,10 +1710,10 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v4.2.0");
-  log("  Model: Claude Opus 4.5 (Most Intelligent)");
+  log("  n8n Auto-Fix Server v5.0.0");
+  log("  Model: Claude Opus 4.6 (Most Intelligent)");
   log("  Features: Comprehensive scan, pattern detection, auto-retry");
-  log("  NEW: Token truncation & data budget management");
+  log("  NEW: alwaysOutputData fix, stale $json detection, node_options");
   log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
   log(`  Max String Length: ${MAX_STRING_LENGTH}`);
   log("═══════════════════════════════════════════════════════════");
