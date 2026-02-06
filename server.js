@@ -19,9 +19,6 @@ const ERROR_WORKFLOW_ID = "JtMGyvm5ub4nlDxe";
 // Cooldown to prevent repeated fix attempts
 const COOLDOWN_MS = 5 * 60 * 1000;
 
-// Maximum retries after successful fix
-const MAX_RETRIES = 2;
-
 // Circuit breaker: stop after N consecutive failures per workflow
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_RESET_MS = 60 * 60 * 1000; // 1 hour
@@ -42,7 +39,6 @@ const MAX_UPSTREAM_NODES = 10; // Max upstream nodes to include
 const DATA_DIR = path.join(__dirname, "data");
 const PROCESSED_FILE = path.join(DATA_DIR, "processed-executions.json");
 const FIX_HISTORY_FILE = path.join(DATA_DIR, "fix-history.json");
-const RETRY_CHAINS_FILE = path.join(DATA_DIR, "retry-chains.json");
 const SNAPSHOTS_DIR = path.join(DATA_DIR, "snapshots");
 
 // =============================================================================
@@ -52,9 +48,6 @@ const SNAPSHOTS_DIR = path.join(DATA_DIR, "snapshots");
 const queue = [];
 let processing = false;
 const lastProcessed = new Map();
-
-// Retry chain tracking: executionId -> {originalExecutionId, retryCount, workflowId, workflowName, errorSignature, fixHistory}
-const retryChains = new Map();
 
 // Execution-level dedup: Set of execution IDs already processed
 let processedExecutions = new Set();
@@ -204,63 +197,6 @@ function truncateToTokenBudget(data, maxTokens = MAX_TOKEN_ESTIMATE) {
 }
 
 // =============================================================================
-// ERROR SIGNATURE UTILITIES
-// =============================================================================
-
-/**
- * Create a signature for an error to compare with previous errors
- * Returns: { node, errorType, errorMessage }
- */
-function createErrorSignature(errorData) {
-  return {
-    node: errorData.failedNodeName || "Unknown",
-    errorType: extractErrorType(errorData.errorMessage || ""),
-    errorMessage: (errorData.errorMessage || "").substring(0, 200) // Truncate for comparison
-  };
-}
-
-/**
- * Extract error type from error message (e.g., UNKNOWN_FIELD_NAME, INVALID_RECORDS)
- */
-function extractErrorType(errorMessage) {
-  // Common n8n/Airtable error patterns
-  const patterns = [
-    /Unknown field name/i,
-    /UNKNOWN_FIELD_NAME/i,
-    /INVALID_RECORDS/i,
-    /Your request is invalid/i,
-    /Could not find property/i,
-    /Cannot read propert/i,
-    /is not defined/i,
-    /401|403|Unauthorized|Forbidden/i,
-    /429|Rate limit/i,
-    /500|502|503|504|Internal Server Error/i,
-    /ECONNRESET|ETIMEDOUT|Network/i
-  ];
-
-  for (const pattern of patterns) {
-    if (pattern.test(errorMessage)) {
-      return pattern.source.replace(/[\\|\/\[\]()]/g, '').substring(0, 30);
-    }
-  }
-  return "GENERAL_ERROR";
-}
-
-/**
- * Compare two error signatures
- * Returns: "same_error" | "same_node_different_error" | "different_node"
- */
-function compareErrorSignatures(prev, current) {
-  if (prev.node !== current.node) {
-    return "different_node";
-  }
-  if (prev.errorType === current.errorType && prev.errorMessage === current.errorMessage) {
-    return "same_error";
-  }
-  return "same_node_different_error";
-}
-
-// =============================================================================
 // PERSISTENT STORAGE
 // =============================================================================
 
@@ -320,27 +256,6 @@ function addFixAttempt(workflowId, entry) {
     fixHistory[workflowId] = fixHistory[workflowId].slice(-20);
   }
   saveFixHistory();
-}
-
-function loadRetryChains() {
-  try {
-    const data = JSON.parse(fs.readFileSync(RETRY_CHAINS_FILE, "utf8"));
-    for (const [k, v] of Object.entries(data)) {
-      retryChains.set(k, v);
-    }
-    log(`Loaded ${retryChains.size} retry chains`);
-  } catch {
-    // first run
-  }
-}
-
-function saveRetryChains() {
-  try {
-    const obj = Object.fromEntries(retryChains);
-    fs.writeFileSync(RETRY_CHAINS_FILE, JSON.stringify(obj, null, 2));
-  } catch (err) {
-    log(`Failed to save retry chains: ${err.message}`);
-  }
 }
 
 // =============================================================================
@@ -558,44 +473,9 @@ You can provide parameters, node_options, or both in a single call.`,
     }
   },
   {
-    name: "retry_execution",
-    description: `Retry a failed execution after successfully fixing the workflow. This re-runs the execution to verify the fix works.
-
-IMPORTANT RULES:
-- Only call this AFTER a successful fix AND validation
-- Check the retry_context in the error info - if retryCount >= 2, DO NOT retry (max retries reached)
-- The system will automatically send a Slack notification about the retry
-- If the retry fails, you'll receive the new error automatically
-
-Returns the new execution ID if successful.`,
-    input_schema: {
-      type: "object",
-      properties: {
-        execution_id: {
-          type: "string",
-          description: "The execution ID to retry"
-        },
-        workflow_id: {
-          type: "string",
-          description: "The workflow ID (for tracking)"
-        },
-        workflow_name: {
-          type: "string",
-          description: "The workflow name (for Slack notification)"
-        },
-        fix_summary: {
-          type: "string",
-          description: "Brief summary of what was fixed (for Slack notification)"
-        }
-      },
-      required: ["execution_id", "workflow_id", "workflow_name", "fix_summary"]
-    }
-  },
-  {
     name: "rollback_workflow",
     description: `Revert a workflow to its state before the most recent auto-fix attempt. Use this when:
 - A fix made things worse
-- The retry after a fix still fails with the same or a new error
 - You realize the fix was incorrect
 
 This restores the workflow from the snapshot taken before the last update_node call.`,
@@ -640,7 +520,7 @@ This restores the workflow from the snapshot taken before the last update_node c
 
 const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude Opus 4.6, the most intelligent AI model. Your job is to analyze workflow errors and fix them with precision.
 
-## Your Process (COMPREHENSIVE FIX + RETRY)
+## Your Process (COMPREHENSIVE FIX)
 1. ALWAYS start by calling get_execution_details to understand the full error context
 2. **CHECK FIX HISTORY** (provided in the error info) — if previous attempts are listed, DO NOT repeat fixes that already failed. Try a completely different approach or classify as not auto-fixable.
 3. Analyze the error type and determine if it's auto-fixable
@@ -650,13 +530,8 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 5. Fix ALL affected nodes, not just the immediately failing one
 6. Validate with validate_workflow after ALL fixes are applied
 7. Send a Slack notification with complete results (list ALL nodes fixed)
-8. **RETRY STEP (if fix was successful):**
-   - Check the retry_context in the error info
-   - If retryCount < 2 (max retries), call retry_execution to verify the fix works
-   - If retryCount >= 2, DO NOT retry - send "max retries reached" notification instead
-   - The retry will automatically re-run the workflow; if it fails again, you'll get a new error
-9. Call complete() with fix_description so it's recorded in history
-10. **If your fix fails on retry**: Use rollback_workflow to revert your changes before trying something else
+8. Call complete() with fix_description so it's recorded in history
+9. **If your fix was wrong**: Use rollback_workflow to revert your changes
 
 ## Fix History Rules (CRITICAL)
 - The error info includes a "Previous Fix Attempts" section showing what was already tried
@@ -665,45 +540,9 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 - Always provide a fix_description when calling complete() so future attempts know what was tried
 
 ## Rollback Rules
-- If you apply a fix and the retry still fails with the SAME error, use rollback_workflow to undo your changes
+- If you realize a fix was incorrect, use rollback_workflow to undo your changes
 - This prevents stacking bad fixes on top of each other
 - After rolling back, try a different approach or classify as not auto-fixable
-
-## Retry Rules (IMPORTANT)
-- After a SUCCESSFUL fix + validation, you SHOULD call retry_execution to close the loop
-- The retry_execution tool will send its own Slack notification - you don't need to notify about the retry separately
-- If retry_context shows retryCount >= 2, do NOT retry - instead send a "max retries reached" message
-- Each retry counts: if the workflow fails at a DIFFERENT node after retry, it still uses up a retry
-- Max 2 retries total per execution chain (original fail → fix → retry1 → fail → fix → retry2 → fail → stop)
-
-## CRITICAL: Handling Retry Failures (ERROR SIGNATURE COMPARISON)
-
-When you receive an error that is part of a retry chain (retry_context is present), the system compares error signatures. Check the **error_comparison** field:
-
-### If error_comparison = "same_error"
-The SAME error occurred at the SAME node after your fix. This means:
-- Your previous fix DID NOT WORK
-- You need to try a DIFFERENT approach
-- Review what was tried before (see fix_history) and try something else
-- Consider if you misdiagnosed the root cause
-
-**Action:** Investigate deeper, try a different fix strategy, or mark as not auto-fixable if you've exhausted options.
-
-### If error_comparison = "same_node_different_error"
-The same node failed but with a DIFFERENT error. This means:
-- Your previous fix may have partially worked
-- There's another issue with the same node
-- Fix this new error
-
-**Action:** Analyze the new error and fix it.
-
-### If error_comparison = "different_node"
-A DIFFERENT node is now failing. This means:
-- Your previous fix WORKED (that node passed!)
-- But it uncovered another issue downstream
-- This is progress - the workflow got further
-
-**Action:** Fix this new node's error. The chain continues.
 
 ## IMPORTANT: Comprehensive Fix Rule
 When you identify a root cause like:
@@ -989,41 +828,7 @@ For NOT FIXABLE errors:
 2. {step 2}
 3. {step 3}
 
-_Analyzed by Claude Opus 4.6 at {timestamp}_\`
-
-For MAX RETRIES REACHED (when retryCount >= 2 and still failing):
-\`:stop_sign: *Max Retries Reached: {workflow_name}*
-
-*Error:* {error_message}
-*Failed Node:* {node_name}
-*Execution:* <{execution_url}|View Execution #{execution_id}>
-
-*Retry History:*
-• Original execution: {original_execution_id}
-• Retries attempted: 2/2
-
-*Why stopping:* The workflow has been fixed and retried twice but is still encountering errors. This indicates a deeper issue that requires manual investigation.
-
-*Suggested next steps:*
-1. Review the execution history to see which nodes failed at each attempt
-2. Check if the issue is data-dependent (specific input causing failures)
-3. Test the workflow manually with sample data
-
-_Manual investigation required._\`
-
-For RETRY FAILURE with SAME ERROR (fix didn't work):
-\`:warning: *Previous Fix Didn't Work: {workflow_name}*
-
-*Error:* {error_message} (same as before)
-*Failed Node:* {node_name}
-*Execution:* <{execution_url}|View Execution #{execution_id}>
-
-*Previous Fix Attempted:* {fix_history}
-*Result:* Same error occurred - fix was ineffective
-
-*New Approach:* {what you're trying differently}
-
-_Troubleshooting by Claude Opus 4.6..._\``;
+_Analyzed by Claude Opus 4.6 at {timestamp}_\``;
 
 // =============================================================================
 // TOOL HANDLERS
@@ -1442,90 +1247,6 @@ async function handleSendSlackNotification(message) {
   return { success: true, message: "Notification sent to Slack" };
 }
 
-async function handleRetryExecution(executionId, workflowId, workflowName, fixSummary) {
-  log(`Retrying execution ${executionId}...`);
-
-  // Get current retry count for this chain
-  const chainInfo = retryChains.get(executionId);
-  const currentRetryCount = chainInfo ? chainInfo.retryCount : 0;
-  const originalExecutionId = chainInfo ? chainInfo.originalExecutionId : executionId;
-
-  if (currentRetryCount >= MAX_RETRIES) {
-    return {
-      success: false,
-      error: `Max retries (${MAX_RETRIES}) reached for this execution chain`,
-      retryCount: currentRetryCount
-    };
-  }
-
-  // Call n8n API to retry the execution
-  const url = `${N8N_API_URL}/api/v1/executions/${executionId}/retry`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-N8N-API-KEY": N8N_API_KEY
-    }
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Failed to retry execution: ${res.status} - ${text}`);
-  }
-
-  const retryResult = await res.json();
-  const newExecutionId = retryResult.id;
-  const newRetryCount = currentRetryCount + 1;
-
-  // Build fix history
-  const previousFixHistory = chainInfo?.fixHistory || [];
-  const newFixHistory = [...previousFixHistory, {
-    attempt: newRetryCount,
-    fix: fixSummary,
-    timestamp: new Date().toISOString()
-  }];
-
-  // Create error signature for tracking
-  const currentErrorSignature = chainInfo?.errorSignature || null;
-
-  // Track the new execution in the retry chain (and persist)
-  retryChains.set(newExecutionId, {
-    originalExecutionId,
-    retryCount: newRetryCount,
-    workflowId,
-    workflowName,
-    previousExecutionId: executionId,
-    errorSignature: currentErrorSignature,
-    fixHistory: newFixHistory,
-    timestamp: Date.now()
-  });
-  saveRetryChains();
-
-  // Build execution URL
-  const executionUrl = `${N8N_API_URL}/workflow/${workflowId}/executions/${newExecutionId}`;
-
-  // Send Slack notification about retry
-  const retryMessage = `:arrows_counterclockwise: *Retry Triggered: ${workflowName}* (${newRetryCount}/${MAX_RETRIES})
-
-*Fix Applied:* ${fixSummary}
-*Original Execution:* ${originalExecutionId}
-*New Execution:* <${executionUrl}|View Execution #${newExecutionId}>
-
-_Retrying to verify the fix works..._`;
-
-  await handleSendSlackNotification(retryMessage);
-
-  log(`Retry triggered: ${newExecutionId} (retry ${newRetryCount}/${MAX_RETRIES})`);
-
-  return {
-    success: true,
-    newExecutionId,
-    retryCount: newRetryCount,
-    maxRetries: MAX_RETRIES,
-    message: `Execution retried. New execution ID: ${newExecutionId} (retry ${newRetryCount}/${MAX_RETRIES})`
-  };
-}
-
 async function handleRollbackWorkflow(workflowId) {
   log(`Rolling back workflow ${workflowId}...`);
 
@@ -1642,14 +1363,6 @@ async function executeTool(toolName, toolInput) {
       case "send_slack_notification":
         return await handleSendSlackNotification(toolInput.message);
 
-      case "retry_execution":
-        return await handleRetryExecution(
-          toolInput.execution_id,
-          toolInput.workflow_id,
-          toolInput.workflow_name,
-          toolInput.fix_summary
-        );
-
       case "rollback_workflow":
         return await handleRollbackWorkflow(toolInput.workflow_id);
 
@@ -1674,50 +1387,8 @@ async function executeTool(toolName, toolInput) {
 // CLAUDE API WITH TOOL USE (AGENTIC LOOP)
 // =============================================================================
 
-async function runAgentLoop(errorData, retryContext = null) {
+async function runAgentLoop(errorData) {
   const timestamp = errorData.timestamp || new Date().toISOString();
-
-  // Build retry context string if this is part of a retry chain
-  let retryInfo = "";
-  if (retryContext) {
-    // Format fix history
-    const fixHistoryStr = retryContext.fixHistory && retryContext.fixHistory.length > 0
-      ? retryContext.fixHistory.map((f, i) => `  ${i + 1}. ${f.fix}`).join("\n")
-      : "  (none recorded)";
-
-    retryInfo = `
-
-## Retry Context
-- **This is retry attempt**: ${retryContext.retryCount}/${MAX_RETRIES}
-- **Original Execution ID**: ${retryContext.originalExecutionId}
-- **Previous Execution ID**: ${retryContext.previousExecutionId}
-- **Error Comparison**: ${retryContext.errorComparison || "unknown"}
-- **Previous Error Node**: ${retryContext.previousErrorSignature?.node || "unknown"}
-- **Previous Error Type**: ${retryContext.previousErrorSignature?.errorType || "unknown"}
-
-### Fix History (what was already tried):
-${fixHistoryStr}
-
-### Interpretation:
-${retryContext.errorComparison === "same_error"
-    ? "**SAME ERROR** - Your previous fix DID NOT WORK. Try a DIFFERENT approach or mark as not auto-fixable."
-    : retryContext.errorComparison === "same_node_different_error"
-    ? "**SAME NODE, DIFFERENT ERROR** - Previous fix partially worked. Fix this new error."
-    : retryContext.errorComparison === "different_node"
-    ? "**DIFFERENT NODE** - Your previous fix WORKED! The workflow got further. Fix this new node."
-    : "First retry - compare with original error."}
-
-- **IMPORTANT**: ${retryContext.retryCount >= MAX_RETRIES
-    ? "MAX RETRIES REACHED - DO NOT call retry_execution again. Send a 'max retries reached' notification instead."
-    : `You can retry ${MAX_RETRIES - retryContext.retryCount} more time(s) after fixing.`}`;
-  } else {
-    retryInfo = `
-
-## Retry Context
-- **This is the original failure** (not a retry)
-- **Retries available**: ${MAX_RETRIES}
-- **After fixing**: Call retry_execution to verify the fix works`;
-  }
 
   // Build fix history context from persistent storage
   const history = fixHistory[errorData.workflowId] || [];
@@ -1745,7 +1416,7 @@ ${retryContext.errorComparison === "same_error"
 - **Error Message**: ${truncateString(errorData.errorMessage, 500)}
 - **Execution ID**: ${errorData.executionId}
 - **Execution URL**: ${errorData.executionUrl}
-- **Timestamp**: ${timestamp}${retryInfo}${historyContext}
+- **Timestamp**: ${timestamp}${historyContext}
 
 Start by fetching the execution details to get full context about the error.`
     }
@@ -1912,50 +1583,13 @@ async function processError(errorData) {
     return;
   }
 
-  // Check if this execution is part of a retry chain — compare error signatures
-  let retryContext = retryChains.get(executionId);
-
-  if (retryContext) {
-    // This is a retry that failed - compare error signatures
-    const currentSignature = createErrorSignature(errorData);
-    const previousSignature = retryContext.errorSignature;
-
-    if (previousSignature) {
-      const comparison = compareErrorSignatures(previousSignature, currentSignature);
-      retryContext.errorComparison = comparison;
-      retryContext.previousErrorSignature = previousSignature;
-      log(`Retry failure comparison: ${comparison} (prev: ${previousSignature.node}/${previousSignature.errorType}, curr: ${currentSignature.node}/${currentSignature.errorType})`);
-    }
-
-    // Update the signature for next potential retry
-    retryContext.errorSignature = currentSignature;
-
-    log(`This is retry ${retryContext.retryCount}/${MAX_RETRIES} for chain starting at ${retryContext.originalExecutionId}`);
-  } else {
-    // First failure - create initial error signature for future comparison
-    const initialSignature = createErrorSignature(errorData);
-
-    retryChains.set(executionId, {
-      originalExecutionId: executionId,
-      retryCount: 0,
-      workflowId,
-      workflowName,
-      errorSignature: initialSignature,
-      fixHistory: [],
-      timestamp: Date.now()
-    });
-    saveRetryChains();
-
-    log(`Original failure - created error signature: ${initialSignature.node}/${initialSignature.errorType}`);
-  }
-
-  log(`Starting agent for: ${workflowName} (${workflowId})${retryContext ? ` [Retry ${retryContext.retryCount}/${MAX_RETRIES}]` : ''}`);
+  log(`Starting agent for: ${workflowName} (${workflowId})`);
 
   let agentSuccess = false;
   let agentFixDescription = "";
 
   try {
-    const result = await runAgentLoop(errorData, retryContext);
+    const result = await runAgentLoop(errorData);
     if (result) {
       agentSuccess = result.success || false;
       agentFixDescription = result.fix_description || result.summary || "";
@@ -1981,17 +1615,6 @@ async function processError(errorData) {
   } else {
     recordCircuitFailure(workflowId, errorData.errorMessage);
   }
-
-  // Clean up old retry chain entries (older than 1 hour) to prevent memory leaks
-  const oneHourAgo = Date.now() - 60 * 60 * 1000;
-  let chainsModified = false;
-  for (const [execId, chain] of retryChains.entries()) {
-    if (chain.timestamp && chain.timestamp < oneHourAgo) {
-      retryChains.delete(execId);
-      chainsModified = true;
-    }
-  }
-  if (chainsModified) saveRetryChains();
 }
 
 // =============================================================================
@@ -2025,18 +1648,10 @@ async function processNext() {
     return;
   }
 
-  // Check if this execution is part of a retry chain BEFORE checking cooldown
-  const isRetryChainError = retryChains.has(executionId);
-
-  // Bypass cooldown for retry chain errors - they need troubleshooting
-  if (!isRetryChainError && isOnCooldown(workflowId)) {
-    log(`Skipping ${workflowId} - on cooldown (not a retry chain)`);
+  if (isOnCooldown(workflowId)) {
+    log(`Skipping ${workflowId} - on cooldown`);
     processNext();
     return;
-  }
-
-  if (isRetryChainError) {
-    log(`Processing retry chain error for ${workflowId} (bypassing cooldown)`);
   }
 
   processing = true;
@@ -2097,17 +1712,14 @@ const server = http.createServer((req, res) => {
       version: "5.0.0",
       model: CLAUDE_MODEL,
       features: [
-        "comprehensive_scan", "pattern_detection", "multi_node_fix", "auto_retry",
-        "error_signature_comparison", "retry_troubleshooting",
+        "comprehensive_scan", "pattern_detection", "multi_node_fix",
         "token_truncation", "data_budget_management",
         "always_output_data_fix", "stale_json_detection", "node_options_support",
         "execution_dedup", "fix_memory", "circuit_breaker", "error_classification",
         "workflow_snapshots", "rollback", "batch_notifications"
       ],
-      maxRetries: MAX_RETRIES,
       maxTokenEstimate: MAX_TOKEN_ESTIMATE,
       circuitBreakerThreshold: CIRCUIT_BREAKER_THRESHOLD,
-      activeRetryChains: retryChains.size,
       processedExecutions: processedExecutions.size,
       openCircuitBreakers: [...circuitBreakers.entries()]
         .filter(([, cb]) => cb.failures >= CIRCUIT_BREAKER_THRESHOLD)
@@ -2181,7 +1793,7 @@ function checkConfig() {
   log("═══════════════════════════════════════════════════════════");
   log("  n8n Auto-Fix Server v5.0.0");
   log("  Model: Claude Opus 4.6 (Most Intelligent)");
-  log("  Features: Comprehensive scan, pattern detection, auto-retry");
+  log("  Features: Comprehensive scan, pattern detection, auto-fix");
   log("  NEW: Fix memory, circuit breaker, execution dedup, rollback");
   log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
   log(`  Max String Length: ${MAX_STRING_LENGTH}`);
@@ -2192,7 +1804,6 @@ function checkConfig() {
 ensureDataDirs();
 loadProcessedExecutions();
 loadFixHistory();
-loadRetryChains();
 checkConfig();
 
 server.listen(PORT, () => {
