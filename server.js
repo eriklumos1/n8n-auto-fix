@@ -1730,6 +1730,34 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Bridge data endpoint for Claude Code compound engineering
+  if (req.method === "GET" && req.url === "/api/bridge-data") {
+    let snapshotCount = 0;
+    try {
+      snapshotCount = fs.readdirSync(SNAPSHOTS_DIR).filter(f => f.endsWith(".json")).length;
+    } catch (e) { /* snapshots dir may not exist */ }
+
+    const circuitBreakerState = {};
+    for (const [id, cb] of circuitBreakers.entries()) {
+      circuitBreakerState[id] = {
+        failures: cb.failures,
+        openedAt: cb.openedAt || null,
+        lastError: cb.lastError || null,
+        isOpen: cb.failures >= CIRCUIT_BREAKER_THRESHOLD
+      };
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      fixHistory,
+      circuitBreakers: circuitBreakerState,
+      snapshotCount,
+      processedExecutionCount: processedExecutions.size,
+      generatedAt: new Date().toISOString()
+    }));
+    return;
+  }
+
   // Error webhook
   if (req.method === "POST" && req.url === "/n8n-error") {
     let body = "";
