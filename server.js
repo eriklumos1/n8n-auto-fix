@@ -23,6 +23,10 @@ const COOLDOWN_MS = 5 * 60 * 1000;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 const CIRCUIT_BREAKER_RESET_MS = 60 * 60 * 1000; // 1 hour
 
+// Recurrence detection: if same error returns within this window, prior "success" was false
+const RECURRENCE_WINDOW_MS = 72 * 60 * 60 * 1000; // 72 hours
+const RECURRENCE_CIRCUIT_THRESHOLD = 2; // Open circuit after 2 recurrences
+
 // Batch notification delay (ms) to group simultaneous errors
 const ACK_BATCH_DELAY = 30000; // 30 seconds
 
@@ -63,6 +67,71 @@ const pendingAcks = new Map();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// =============================================================================
+// ERROR FINGERPRINTING & RECURRENCE DETECTION
+// =============================================================================
+
+/**
+ * Normalize an error message into a comparable fingerprint.
+ * Strips execution IDs, timestamps, UUIDs, and variable data so the same
+ * logical error always produces the same fingerprint.
+ */
+function errorFingerprint(errorMessage) {
+  return (errorMessage || "")
+    .toLowerCase()
+    .replace(/execution \d+/g, "execution X")
+    .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*/g, "TIMESTAMP")
+    .replace(/#\d+/g, "#X")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "UUID")
+    .replace(/\d{5,}/g, "ID")
+    .trim()
+    .slice(0, 150);
+}
+
+/**
+ * Detect if this error is a recurrence of a previously "fixed" error.
+ * If so, retroactively mark prior "successful" fixes as actually failed.
+ *
+ * Returns { isRecurring, attemptCount, previousAttempts }
+ */
+function detectRecurrence(workflowId, errorMessage) {
+  const history = fixHistory[workflowId] || [];
+  if (history.length === 0) {
+    return { isRecurring: false, attemptCount: 0, previousAttempts: [] };
+  }
+
+  const currentFP = errorFingerprint(errorMessage);
+  const now = Date.now();
+  const matchingAttempts = [];
+
+  for (const entry of history) {
+    const entryFP = entry.errorFingerprint || errorFingerprint(entry.errorMessage);
+    if (entryFP !== currentFP) continue;
+
+    const age = now - (entry.timestamp || 0);
+    if (age > RECURRENCE_WINDOW_MS) continue;
+
+    matchingAttempts.push(entry);
+
+    // Retroactively mark "successful" fixes as actually failed
+    if (entry.success && entry.actualSuccess !== false) {
+      entry.actualSuccess = false;
+      entry.recurrenceDetected = true;
+      log(`Retroactively marked fix as ACTUALLY FAILED: "${entry.fixAttempted}" (workflow ${workflowId})`);
+    }
+  }
+
+  if (matchingAttempts.length > 0) {
+    saveFixHistory(); // Persist the retroactive updates
+  }
+
+  return {
+    isRecurring: matchingAttempts.length > 0,
+    attemptCount: matchingAttempts.length,
+    previousAttempts: matchingAttempts
+  };
 }
 
 // =============================================================================
@@ -250,7 +319,13 @@ function saveFixHistory() {
 
 function addFixAttempt(workflowId, entry) {
   if (!fixHistory[workflowId]) fixHistory[workflowId] = [];
-  fixHistory[workflowId].push({ ...entry, timestamp: Date.now() });
+  fixHistory[workflowId].push({
+    ...entry,
+    timestamp: Date.now(),
+    errorFingerprint: errorFingerprint(entry.errorMessage),
+    actualSuccess: entry.success ? null : false, // null = pending verification, false = confirmed failure
+    recurrenceDetected: false
+  });
   // Keep last 20 attempts per workflow
   if (fixHistory[workflowId].length > 20) {
     fixHistory[workflowId] = fixHistory[workflowId].slice(-20);
@@ -259,13 +334,17 @@ function addFixAttempt(workflowId, entry) {
 }
 
 // =============================================================================
-// CIRCUIT BREAKER
+// CIRCUIT BREAKER (recurrence-aware)
 // =============================================================================
 
 function isCircuitOpen(workflowId) {
   const cb = circuitBreakers.get(workflowId);
   if (!cb) return false;
-  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+
+  const isOpenByFailures = cb.failures >= CIRCUIT_BREAKER_THRESHOLD;
+  const isOpenByRecurrences = cb.recurrences >= RECURRENCE_CIRCUIT_THRESHOLD;
+
+  if (isOpenByFailures || isOpenByRecurrences) {
     // Auto-reset after timeout
     if (Date.now() - cb.openedAt > CIRCUIT_BREAKER_RESET_MS) {
       circuitBreakers.delete(workflowId);
@@ -278,14 +357,28 @@ function isCircuitOpen(workflowId) {
 }
 
 function recordCircuitFailure(workflowId, errorMessage) {
-  const cb = circuitBreakers.get(workflowId) || { failures: 0, openedAt: null, lastError: "" };
+  const cb = circuitBreakers.get(workflowId) || { failures: 0, recurrences: 0, openedAt: null, lastError: "" };
   cb.failures++;
   cb.lastError = errorMessage;
-  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD && !cb.openedAt) {
+  const threshold = cb.failures >= CIRCUIT_BREAKER_THRESHOLD || cb.recurrences >= RECURRENCE_CIRCUIT_THRESHOLD;
+  if (threshold && !cb.openedAt) {
     cb.openedAt = Date.now();
   }
   circuitBreakers.set(workflowId, cb);
-  return cb.failures >= CIRCUIT_BREAKER_THRESHOLD;
+  return threshold;
+}
+
+function recordCircuitRecurrence(workflowId, errorMessage) {
+  const cb = circuitBreakers.get(workflowId) || { failures: 0, recurrences: 0, openedAt: null, lastError: "" };
+  cb.recurrences++;
+  cb.lastError = errorMessage;
+  const threshold = cb.recurrences >= RECURRENCE_CIRCUIT_THRESHOLD;
+  if (threshold && !cb.openedAt) {
+    cb.openedAt = Date.now();
+    log(`Circuit breaker OPENED for ${workflowId} due to ${cb.recurrences} recurrences`);
+  }
+  circuitBreakers.set(workflowId, cb);
+  return threshold;
 }
 
 function resetCircuitBreaker(workflowId) {
@@ -536,8 +629,16 @@ const SYSTEM_PROMPT = `You are an expert n8n workflow debugger powered by Claude
 ## Fix History Rules (CRITICAL)
 - The error info includes a "Previous Fix Attempts" section showing what was already tried
 - If a fix was already attempted and FAILED, DO NOT try the same fix again
+- If a fix "APPEARED TO WORK BUT RECURRED", it means validation passed but the error came back — this fix does NOT work, do NOT repeat it
 - If 3+ different fixes have already failed for the same error pattern, classify as NOT auto-fixable
 - Always provide a fix_description when calling complete() so future attempts know what was tried
+
+## Recurrence Rules (CRITICAL)
+- If the prompt says "RECURRING ERROR", previous fixes did NOT actually work despite passing validation
+- You MUST try a fundamentally different approach — not a variation of the same fix
+- "Fundamentally different" means: change the node's mappingMode, use a different node type, restructure the data flow, etc.
+- If you cannot think of a genuinely different approach, call complete({success: false}) and recommend manual investigation
+- NEVER apply the same schema/config fix that has already recurred
 
 ## Rollback Rules
 - If you realize a fix was incorrect, use rollback_workflow to undo your changes
@@ -1387,21 +1488,47 @@ async function executeTool(toolName, toolInput) {
 // CLAUDE API WITH TOOL USE (AGENTIC LOOP)
 // =============================================================================
 
-async function runAgentLoop(errorData) {
+async function runAgentLoop(errorData, recurrence = { isRecurring: false, attemptCount: 0, previousAttempts: [] }) {
   const timestamp = errorData.timestamp || new Date().toISOString();
 
   // Build fix history context from persistent storage
   const history = fixHistory[errorData.workflowId] || [];
   const recentHistory = history.slice(-5);
   let historyContext = "";
-  if (recentHistory.length > 0) {
+
+  if (recurrence.isRecurring && recurrence.previousAttempts.length > 0) {
+    // CRITICAL: This is a recurring error — previous "fixes" didn't actually work
+    historyContext = `\n\n## ⚠️ CRITICAL: RECURRING ERROR (attempt #${recurrence.attemptCount + 1})
+This EXACT error has been "fixed" ${recurrence.attemptCount} time(s) before but KEEPS COMING BACK.
+The previous fixes appeared to work (passed validation) but the error recurred within 24-48 hours.
+
+**Previous fixes that APPEARED to work but DID NOT actually fix the issue:**\n`;
+    for (const h of recurrence.previousAttempts) {
+      const time = new Date(h.timestamp).toLocaleDateString();
+      historyContext += `- ${time}: "${h.fixAttempted}" → APPEARED TO WORK BUT RECURRED\n`;
+    }
+    historyContext += `
+**YOU MUST NOT apply the same type of fix again.** The schema/config approach has been tried repeatedly and fails.
+Either:
+1. Try a FUNDAMENTALLY DIFFERENT approach (e.g., change mappingMode from "defineBelow" to "autoMapInputData", restructure the node entirely, or use a different node type)
+2. Classify as NOT auto-fixable and explain why in the Slack notification — recommend specific manual investigation steps
+
+If you cannot identify a genuinely new approach, call complete({success: false}) and explain that this requires manual investigation.\n`;
+  } else if (recentHistory.length > 0) {
     historyContext = `\n\n## Previous Fix Attempts (IMPORTANT — DO NOT REPEAT FAILED FIXES)\n`;
     for (const h of recentHistory) {
       const time = new Date(h.timestamp).toISOString();
-      const status = h.success ? "SUCCESS" : "FAILED";
+      let status;
+      if (h.recurrenceDetected) {
+        status = "APPEARED TO WORK BUT RECURRED";
+      } else if (h.success) {
+        status = "SUCCESS";
+      } else {
+        status = "FAILED";
+      }
       historyContext += `- ${time}: "${h.fixAttempted}" → ${status} (error: ${h.errorMessage || "N/A"})\n`;
     }
-    historyContext += `\nDo NOT try the same fix that already failed. Try a different approach or classify as not auto-fixable.\n`;
+    historyContext += `\nDo NOT try the same fix that already failed or recurred. Try a different approach or classify as not auto-fixable.\n`;
   }
 
   const messages = [
@@ -1583,13 +1710,35 @@ async function processError(errorData) {
     return;
   }
 
+  // Recurrence detection: check if this error was "fixed" before but came back
+  const recurrence = detectRecurrence(workflowId, errorData.errorMessage);
+
+  if (recurrence.isRecurring) {
+    log(`RECURRENCE DETECTED for ${workflowName}: attempt #${recurrence.attemptCount + 1}`);
+
+    // Record recurrence in circuit breaker
+    const tripped = recordCircuitRecurrence(workflowId, errorData.errorMessage);
+
+    if (tripped) {
+      // Circuit breaker opened due to recurrences — escalate and stop
+      const prevFixes = recurrence.previousAttempts
+        .map((a, i) => `${i + 1}. "${a.fixAttempted}" (${new Date(a.timestamp).toLocaleDateString()})`)
+        .join("\n");
+
+      await handleSendSlackNotification(
+        `:no_entry: *Recurring Issue — Circuit Breaker Opened: ${workflowName}*\n\nThe error "${truncateString(errorData.errorMessage, 150)}" on node "${errorData.failedNodeName}" has been "fixed" ${recurrence.attemptCount} times but keeps returning.\n\n*Previous fix attempts (all recurred):*\n${prevFixes}\n\n*Recommendation:* This is likely a deeper issue (node version bug, n8n UI stripping config on save, or wrong fix approach). Manual investigation required.\n\n_Suppressing further auto-fix attempts for 1 hour._`
+      );
+      return;
+    }
+  }
+
   log(`Starting agent for: ${workflowName} (${workflowId})`);
 
   let agentSuccess = false;
   let agentFixDescription = "";
 
   try {
-    const result = await runAgentLoop(errorData);
+    const result = await runAgentLoop(errorData, recurrence);
     if (result) {
       agentSuccess = result.success || false;
       agentFixDescription = result.fix_description || result.summary || "";
@@ -1609,12 +1758,14 @@ async function processError(errorData) {
     success: agentSuccess
   });
 
-  // Update circuit breaker
-  if (agentSuccess) {
+  // Update circuit breaker — DON'T reset on self-reported success if this is a recurring error
+  // The real test is whether the error comes back (checked by detectRecurrence on next occurrence)
+  if (agentSuccess && !recurrence.isRecurring) {
     resetCircuitBreaker(workflowId);
-  } else {
+  } else if (!agentSuccess) {
     recordCircuitFailure(workflowId, errorData.errorMessage);
   }
+  // If agentSuccess && recurrence.isRecurring: leave circuit breaker as-is (pending verification)
 }
 
 // =============================================================================
@@ -1709,14 +1860,15 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "5.0.0",
+      version: "6.0.0",
       model: CLAUDE_MODEL,
       features: [
         "comprehensive_scan", "pattern_detection", "multi_node_fix",
         "token_truncation", "data_budget_management",
         "always_output_data_fix", "stale_json_detection", "node_options_support",
         "execution_dedup", "fix_memory", "circuit_breaker", "error_classification",
-        "workflow_snapshots", "rollback", "batch_notifications"
+        "workflow_snapshots", "rollback", "batch_notifications",
+        "recurrence_detection", "outcome_verification", "escalation_notifications"
       ],
       maxTokenEstimate: MAX_TOKEN_ESTIMATE,
       circuitBreakerThreshold: CIRCUIT_BREAKER_THRESHOLD,
@@ -1741,9 +1893,10 @@ const server = http.createServer((req, res) => {
     for (const [id, cb] of circuitBreakers.entries()) {
       circuitBreakerState[id] = {
         failures: cb.failures,
+        recurrences: cb.recurrences || 0,
         openedAt: cb.openedAt || null,
         lastError: cb.lastError || null,
-        isOpen: cb.failures >= CIRCUIT_BREAKER_THRESHOLD
+        isOpen: cb.failures >= CIRCUIT_BREAKER_THRESHOLD || (cb.recurrences || 0) >= RECURRENCE_CIRCUIT_THRESHOLD
       };
     }
 
@@ -1819,12 +1972,13 @@ function checkConfig() {
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v5.0.0");
+  log("  n8n Auto-Fix Server v6.0.0");
   log("  Model: Claude Opus 4.6 (Most Intelligent)");
   log("  Features: Comprehensive scan, pattern detection, auto-fix");
-  log("  NEW: Fix memory, circuit breaker, execution dedup, rollback");
+  log("  NEW: Recurrence detection, outcome verification, escalation");
   log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
   log(`  Max String Length: ${MAX_STRING_LENGTH}`);
+  log(`  Recurrence Window: ${RECURRENCE_WINDOW_MS / 3600000}h | Circuit Threshold: ${RECURRENCE_CIRCUIT_THRESHOLD} recurrences`);
   log("═══════════════════════════════════════════════════════════");
 }
 
