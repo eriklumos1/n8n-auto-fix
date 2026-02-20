@@ -1,6 +1,6 @@
 {
   "name": "n8n-auto-fix",
-  "version": "7.0.0",
+  "version": "7.1.0",
   "description": "Intelligent auto-fix server for n8n workflow errors using Claude Opus 4.6 with tool use",
   "main": "server.js",
   "scripts": {

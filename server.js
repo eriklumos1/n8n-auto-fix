@@ -14,6 +14,7 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const SLACK_CHANNEL = "C09FEFUG5FT";
+const DIAGNOSE_ONLY = process.env.DIAGNOSE_ONLY !== 'false'; // default: true (diagnose only)
 
 // Never auto-fix the error workflow itself
 const ERROR_WORKFLOW_ID = "JtMGyvm5ub4nlDxe";
@@ -1713,8 +1714,12 @@ Start by fetching the execution details to get full context about the error.`
       body: JSON.stringify({
         model: CLAUDE_MODEL,
         max_tokens: 16384,
-        system: SYSTEM_PROMPT,
-        tools: TOOLS,
+        system: DIAGNOSE_ONLY
+          ? SYSTEM_PROMPT + `\n\n## DIAGNOSE-ONLY MODE (ACTIVE)\nYou are in DIAGNOSE-ONLY mode. Analyze the error and identify the root cause, but do NOT attempt to fix the workflow. Your job is to:\n1. Call get_execution_details to understand the error\n2. Call get_workflow and/or scan_workflow_for_pattern to investigate\n3. Send a Slack notification with: error summary, root cause analysis, and recommended fix steps for a human to apply\n4. Call complete() with your diagnosis summary\n\nDo NOT call update_node or rollback_workflow — those tools are not available in this mode.`
+          : SYSTEM_PROMPT,
+        tools: DIAGNOSE_ONLY
+          ? TOOLS.filter(t => t.name !== 'update_node' && t.name !== 'rollback_workflow')
+          : TOOLS,
         messages: messages
       })
     });
@@ -1876,7 +1881,7 @@ async function processError(errorData) {
 
   let agentSuccess = false;
   let agentFixDescription = "";
-  const MAX_RETRIES = 1;
+  const MAX_RETRIES = DIAGNOSE_ONLY ? 0 : 1;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
@@ -2015,7 +2020,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "7.0.0",
+      version: "7.1.0",
+      mode: DIAGNOSE_ONLY ? "diagnose_only" : "auto_fix",
       persistence: redisAvailable ? "redis" : "memory-only",
       model: CLAUDE_MODEL,
       features: [
