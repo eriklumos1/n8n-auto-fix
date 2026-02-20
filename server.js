@@ -11,6 +11,8 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const N8N_API_URL = process.env.N8N_API_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const SLACK_CHANNEL = "C09FEFUG5FT";
 
 // Never auto-fix the error workflow itself
@@ -65,6 +67,34 @@ const circuitBreakers = new Map();
 // Batch notification accumulator: workflowId -> {count, errors[], timer}
 const pendingAcks = new Map();
 
+// =============================================================================
+// REDIS CLIENT
+// =============================================================================
+
+const { Redis } = require("@upstash/redis");
+
+let redis = null;
+let redisAvailable = false;
+
+function initRedis() {
+  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+    log("WARNING: Upstash Redis not configured. Using in-memory-only mode.");
+    log("Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN for persistence.");
+    return;
+  }
+  try {
+    redis = new Redis({
+      url: UPSTASH_REDIS_REST_URL,
+      token: UPSTASH_REDIS_REST_TOKEN,
+    });
+    redisAvailable = true;
+    log("Upstash Redis client initialized");
+  } catch (err) {
+    log(`WARNING: Failed to initialize Redis client: ${err.message}`);
+    log("Falling back to in-memory-only mode.");
+  }
+}
+
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
@@ -96,7 +126,7 @@ function errorFingerprint(errorMessage) {
  *
  * Returns { isRecurring, attemptCount, previousAttempts }
  */
-function detectRecurrence(workflowId, errorMessage) {
+async function detectRecurrence(workflowId, errorMessage) {
   const history = fixHistory[workflowId] || [];
   if (history.length === 0) {
     return { isRecurring: false, attemptCount: 0, previousAttempts: [] };
@@ -124,7 +154,7 @@ function detectRecurrence(workflowId, errorMessage) {
   }
 
   if (matchingAttempts.length > 0) {
-    saveFixHistory(); // Persist the retroactive updates
+    await saveFixHistory(workflowId); // Persist the retroactive updates
   }
 
   return {
@@ -274,50 +304,126 @@ function ensureDataDirs() {
   if (!fs.existsSync(SNAPSHOTS_DIR)) fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true });
 }
 
-function loadProcessedExecutions() {
+async function loadProcessedExecutions() {
+  // Try Redis first
+  if (redisAvailable) {
+    try {
+      const members = await redis.smembers("autofix:processed");
+      if (members && members.length > 0) {
+        processedExecutions = new Set(members);
+        log(`Loaded ${processedExecutions.size} processed execution IDs from Redis`);
+        return;
+      }
+    } catch (err) {
+      log(`Redis read failed (processed): ${err.message}. Trying file fallback.`);
+    }
+  }
+  // File fallback (local dev or Redis unavailable)
   try {
     const data = fs.readFileSync(PROCESSED_FILE, "utf8");
     const arr = JSON.parse(data);
     processedExecutions = new Set(arr);
-    // Trim to last 500 entries to prevent unbounded growth
     if (processedExecutions.size > 500) {
       const trimmed = [...processedExecutions].slice(-500);
       processedExecutions = new Set(trimmed);
     }
-    log(`Loaded ${processedExecutions.size} processed execution IDs`);
+    log(`Loaded ${processedExecutions.size} processed execution IDs from file`);
   } catch {
     processedExecutions = new Set();
   }
 }
 
-function saveProcessedExecutions() {
+async function addProcessedExecution(executionId) {
+  processedExecutions.add(executionId);
+
+  // Trim in-memory
+  if (processedExecutions.size > 500) {
+    const trimmed = [...processedExecutions].slice(-500);
+    processedExecutions = new Set(trimmed);
+  }
+
+  // Write to Redis (incremental SADD)
+  if (redisAvailable) {
+    try {
+      await redis.sadd("autofix:processed", executionId);
+      // Periodically trim the Redis set (every ~100 additions)
+      const size = await redis.scard("autofix:processed");
+      if (size > 600) {
+        const pipeline = redis.pipeline();
+        pipeline.del("autofix:processed");
+        const members = [...processedExecutions];
+        if (members.length > 0) {
+          pipeline.sadd("autofix:processed", ...members);
+        }
+        await pipeline.exec();
+        log(`Trimmed Redis processed set from ${size} to ${processedExecutions.size}`);
+      }
+    } catch (err) {
+      log(`Redis write failed (processed): ${err.message}`);
+    }
+  }
+  // File backup
   try {
     fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...processedExecutions]));
-  } catch (err) {
-    log(`Failed to save processed executions: ${err.message}`);
-  }
+  } catch { /* best-effort */ }
 }
 
-function loadFixHistory() {
+async function loadFixHistory() {
+  // Try Redis first
+  if (redisAvailable) {
+    try {
+      const data = await redis.hgetall("autofix:history");
+      if (data && Object.keys(data).length > 0) {
+        fixHistory = {};
+        for (const [workflowId, value] of Object.entries(data)) {
+          fixHistory[workflowId] = typeof value === "string" ? JSON.parse(value) : value;
+        }
+        const total = Object.values(fixHistory).reduce((sum, arr) => sum + arr.length, 0);
+        log(`Loaded fix history from Redis: ${total} entries across ${Object.keys(fixHistory).length} workflows`);
+        return;
+      }
+    } catch (err) {
+      log(`Redis read failed (history): ${err.message}. Trying file fallback.`);
+    }
+  }
+  // File fallback
   try {
     const data = fs.readFileSync(FIX_HISTORY_FILE, "utf8");
     fixHistory = JSON.parse(data);
     const total = Object.values(fixHistory).reduce((sum, arr) => sum + arr.length, 0);
-    log(`Loaded fix history: ${total} entries across ${Object.keys(fixHistory).length} workflows`);
+    log(`Loaded fix history from file: ${total} entries across ${Object.keys(fixHistory).length} workflows`);
   } catch {
     fixHistory = {};
   }
 }
 
-function saveFixHistory() {
+async function saveFixHistory(changedWorkflowId) {
+  // Write to Redis
+  if (redisAvailable) {
+    try {
+      if (changedWorkflowId) {
+        // Targeted save — only the changed workflow
+        const value = fixHistory[changedWorkflowId] || [];
+        await redis.hset("autofix:history", { [changedWorkflowId]: JSON.stringify(value) });
+      } else {
+        // Full save (e.g., after bulk modifications)
+        const pipeline = redis.pipeline();
+        for (const [workflowId, attempts] of Object.entries(fixHistory)) {
+          pipeline.hset("autofix:history", { [workflowId]: JSON.stringify(attempts) });
+        }
+        await pipeline.exec();
+      }
+    } catch (err) {
+      log(`Redis write failed (history): ${err.message}`);
+    }
+  }
+  // File backup
   try {
     fs.writeFileSync(FIX_HISTORY_FILE, JSON.stringify(fixHistory, null, 2));
-  } catch (err) {
-    log(`Failed to save fix history: ${err.message}`);
-  }
+  } catch { /* best-effort */ }
 }
 
-function addFixAttempt(workflowId, entry) {
+async function addFixAttempt(workflowId, entry) {
   if (!fixHistory[workflowId]) fixHistory[workflowId] = [];
   fixHistory[workflowId].push({
     ...entry,
@@ -330,12 +436,42 @@ function addFixAttempt(workflowId, entry) {
   if (fixHistory[workflowId].length > 20) {
     fixHistory[workflowId] = fixHistory[workflowId].slice(-20);
   }
-  saveFixHistory();
+  await saveFixHistory(workflowId);
 }
 
 // =============================================================================
 // CIRCUIT BREAKER (recurrence-aware)
 // =============================================================================
+
+async function loadCircuitBreakers() {
+  if (!redisAvailable) return;
+  try {
+    const data = await redis.hgetall("autofix:circuits");
+    if (data && Object.keys(data).length > 0) {
+      for (const [workflowId, value] of Object.entries(data)) {
+        const cb = typeof value === "string" ? JSON.parse(value) : value;
+        circuitBreakers.set(workflowId, cb);
+      }
+      log(`Loaded ${circuitBreakers.size} circuit breakers from Redis`);
+    }
+  } catch (err) {
+    log(`Redis read failed (circuits): ${err.message}`);
+  }
+}
+
+async function saveCircuitBreaker(workflowId) {
+  if (!redisAvailable) return;
+  try {
+    const cb = circuitBreakers.get(workflowId);
+    if (cb) {
+      await redis.hset("autofix:circuits", { [workflowId]: JSON.stringify(cb) });
+    } else {
+      await redis.hdel("autofix:circuits", workflowId);
+    }
+  } catch (err) {
+    log(`Redis write failed (circuit ${workflowId}): ${err.message}`);
+  }
+}
 
 function isCircuitOpen(workflowId) {
   const cb = circuitBreakers.get(workflowId);
@@ -348,6 +484,8 @@ function isCircuitOpen(workflowId) {
     // Auto-reset after timeout
     if (Date.now() - cb.openedAt > CIRCUIT_BREAKER_RESET_MS) {
       circuitBreakers.delete(workflowId);
+      // Fire-and-forget Redis cleanup
+      saveCircuitBreaker(workflowId).catch(() => {});
       log(`Circuit breaker reset for ${workflowId}`);
       return false;
     }
@@ -356,7 +494,7 @@ function isCircuitOpen(workflowId) {
   return false;
 }
 
-function recordCircuitFailure(workflowId, errorMessage) {
+async function recordCircuitFailure(workflowId, errorMessage) {
   const cb = circuitBreakers.get(workflowId) || { failures: 0, recurrences: 0, openedAt: null, lastError: "" };
   cb.failures++;
   cb.lastError = errorMessage;
@@ -365,10 +503,11 @@ function recordCircuitFailure(workflowId, errorMessage) {
     cb.openedAt = Date.now();
   }
   circuitBreakers.set(workflowId, cb);
+  await saveCircuitBreaker(workflowId);
   return threshold;
 }
 
-function recordCircuitRecurrence(workflowId, errorMessage) {
+async function recordCircuitRecurrence(workflowId, errorMessage) {
   const cb = circuitBreakers.get(workflowId) || { failures: 0, recurrences: 0, openedAt: null, lastError: "" };
   cb.recurrences++;
   cb.lastError = errorMessage;
@@ -378,11 +517,13 @@ function recordCircuitRecurrence(workflowId, errorMessage) {
     log(`Circuit breaker OPENED for ${workflowId} due to ${cb.recurrences} recurrences`);
   }
   circuitBreakers.set(workflowId, cb);
+  await saveCircuitBreaker(workflowId);
   return threshold;
 }
 
-function resetCircuitBreaker(workflowId) {
+async function resetCircuitBreaker(workflowId) {
   circuitBreakers.delete(workflowId);
+  await saveCircuitBreaker(workflowId);
 }
 
 // =============================================================================
@@ -1681,8 +1822,7 @@ async function processError(errorData) {
   }
 
   // Mark execution as processed (dedup)
-  processedExecutions.add(executionId);
-  saveProcessedExecutions();
+  await addProcessedExecution(executionId);
 
   // Check circuit breaker
   if (isCircuitOpen(workflowId)) {
@@ -1696,7 +1836,7 @@ async function processError(errorData) {
     log(`Error pre-classified as not fixable: ${classification.category} — ${classification.reason}`);
 
     // Record in circuit breaker
-    const tripped = recordCircuitFailure(workflowId, errorData.errorMessage);
+    const tripped = await recordCircuitFailure(workflowId, errorData.errorMessage);
 
     if (tripped) {
       await handleSendSlackNotification(
@@ -1711,13 +1851,13 @@ async function processError(errorData) {
   }
 
   // Recurrence detection: check if this error was "fixed" before but came back
-  const recurrence = detectRecurrence(workflowId, errorData.errorMessage);
+  const recurrence = await detectRecurrence(workflowId, errorData.errorMessage);
 
   if (recurrence.isRecurring) {
     log(`RECURRENCE DETECTED for ${workflowName}: attempt #${recurrence.attemptCount + 1}`);
 
     // Record recurrence in circuit breaker
-    const tripped = recordCircuitRecurrence(workflowId, errorData.errorMessage);
+    const tripped = await recordCircuitRecurrence(workflowId, errorData.errorMessage);
 
     if (tripped) {
       // Circuit breaker opened due to recurrences — escalate and stop
@@ -1751,7 +1891,7 @@ async function processError(errorData) {
   }
 
   // Record fix attempt in history
-  addFixAttempt(workflowId, {
+  await addFixAttempt(workflowId, {
     executionId,
     errorMessage: errorData.errorMessage,
     fixAttempted: agentFixDescription || "Agent analyzed but no fix applied",
@@ -1761,9 +1901,9 @@ async function processError(errorData) {
   // Update circuit breaker — DON'T reset on self-reported success if this is a recurring error
   // The real test is whether the error comes back (checked by detectRecurrence on next occurrence)
   if (agentSuccess && !recurrence.isRecurring) {
-    resetCircuitBreaker(workflowId);
+    await resetCircuitBreaker(workflowId);
   } else if (!agentSuccess) {
-    recordCircuitFailure(workflowId, errorData.errorMessage);
+    await recordCircuitFailure(workflowId, errorData.errorMessage);
   }
   // If agentSuccess && recurrence.isRecurring: leave circuit breaker as-is (pending verification)
 }
@@ -1860,7 +2000,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
-      version: "6.0.0",
+      version: "7.0.0",
+      persistence: redisAvailable ? "redis" : "memory-only",
       model: CLAUDE_MODEL,
       features: [
         "comprehensive_scan", "pattern_detection", "multi_node_fix",
@@ -1968,26 +2109,41 @@ function checkConfig() {
   if (!SLACK_BOT_TOKEN) missing.push("SLACK_BOT_TOKEN");
 
   if (missing.length > 0) {
-    log(`WARNING: Missing env vars: ${missing.join(", ")}`);
+    log(`WARNING: Missing required env vars: ${missing.join(", ")}`);
+  }
+
+  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+    log("WARNING: Missing UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN — persistence disabled");
   }
 
   log("═══════════════════════════════════════════════════════════");
-  log("  n8n Auto-Fix Server v6.0.0");
+  log("  n8n Auto-Fix Server v7.0.0");
   log("  Model: Claude Opus 4.6 (Most Intelligent)");
+  log(`  Persistence: ${redisAvailable ? "Upstash Redis" : "IN-MEMORY ONLY (no Redis)"}`);
   log("  Features: Comprehensive scan, pattern detection, auto-fix");
-  log("  NEW: Recurrence detection, outcome verification, escalation");
+  log("  Recurrence detection, outcome verification, escalation");
   log(`  Max Token Estimate: ${MAX_TOKEN_ESTIMATE}`);
-  log(`  Max String Length: ${MAX_STRING_LENGTH}`);
   log(`  Recurrence Window: ${RECURRENCE_WINDOW_MS / 3600000}h | Circuit Threshold: ${RECURRENCE_CIRCUIT_THRESHOLD} recurrences`);
   log("═══════════════════════════════════════════════════════════");
 }
 
 // Initialize persistent storage and load state
-ensureDataDirs();
-loadProcessedExecutions();
-loadFixHistory();
-checkConfig();
+async function startup() {
+  ensureDataDirs(); // still needed for snapshots
+  initRedis();
 
-server.listen(PORT, () => {
-  log(`Server listening on port ${PORT}`);
+  await loadProcessedExecutions();
+  await loadFixHistory();
+  await loadCircuitBreakers();
+
+  checkConfig();
+
+  server.listen(PORT, () => {
+    log(`Server listening on port ${PORT}`);
+  });
+}
+
+startup().catch(err => {
+  log(`FATAL: Startup failed: ${err.message}`);
+  process.exit(1);
 });
