@@ -1881,7 +1881,7 @@ async function processError(errorData) {
 
   let agentSuccess = false;
   let agentFixDescription = "";
-  const MAX_RETRIES = DIAGNOSE_ONLY ? 0 : 1;
+  const MAX_RETRIES = 0; // No retries — run agent once
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
@@ -2100,7 +2100,7 @@ const server = http.createServer((req, res) => {
         }
 
         queue.push(errorData);
-        if (!DIAGNOSE_ONLY) queueAcknowledgment(errorData);
+        // Ack messages suppressed — too noisy in Slack
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ queued: true, position: queue.length }));
         processNext();
