@@ -1876,18 +1876,33 @@ async function processError(errorData) {
 
   let agentSuccess = false;
   let agentFixDescription = "";
+  const MAX_RETRIES = 1;
 
-  try {
-    const result = await runAgentLoop(errorData, recurrence);
-    if (result) {
-      agentSuccess = result.success || false;
-      agentFixDescription = result.fix_description || result.summary || "";
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      log(`Retry attempt ${attempt} for: ${workflowName} (${workflowId})`);
     }
-  } catch (error) {
-    log(`Agent error: ${error.message}`);
-    await handleSendSlackNotification(
-      `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${truncateString(errorData.errorMessage, 200)}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
-    );
+
+    try {
+      const result = await runAgentLoop(errorData, recurrence);
+      if (result) {
+        agentSuccess = result.success || false;
+        agentFixDescription = result.fix_description || result.summary || "";
+      }
+    } catch (error) {
+      log(`Agent error (attempt ${attempt + 1}): ${error.message}`);
+      if (attempt >= MAX_RETRIES) {
+        await handleSendSlackNotification(
+          `:rotating_light: *Auto-Fix System Error*\n\nWorkflow: ${workflowName}\nOriginal Error: ${truncateString(errorData.errorMessage, 200)}\n\n*System error:* ${error.message}\n\n_Manual investigation required._`
+        );
+      }
+    }
+
+    if (agentSuccess) break;
+
+    if (attempt < MAX_RETRIES) {
+      log(`First attempt failed for ${workflowName}, retrying once...`);
+    }
   }
 
   // Record fix attempt in history
