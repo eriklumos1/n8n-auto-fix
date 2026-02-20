@@ -2100,7 +2100,7 @@ const server = http.createServer((req, res) => {
         }
 
         queue.push(errorData);
-        queueAcknowledgment(errorData);
+        if (!DIAGNOSE_ONLY) queueAcknowledgment(errorData);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ queued: true, position: queue.length }));
         processNext();
