@@ -19,6 +19,16 @@ const DIAGNOSE_ONLY = process.env.DIAGNOSE_ONLY !== 'false'; // default: true (d
 // Never auto-fix the error workflow itself
 const ERROR_WORKFLOW_ID = "JtMGyvm5ub4nlDxe";
 
+// Revenue-critical workflows auto-fix must NEVER modify. Diagnose + Slack only.
+// Add any workflow where a bad auto-fix would cause revenue loss or a client-facing incident.
+const FIX_EXCLUDED_WORKFLOWS = new Set([
+  "wvbq4bKLZDrGHjUk",  // LinkedIn Onboarding (Lumos)
+  "5jZagYnZIPZzGrAV",  // OS Onboarding
+  "eKy2cnip25bwUB45",  // Client Launch Activation
+  "3offsAqh4AwVhufF",  // Call Transcript Processor
+  "e4ptWFDYcRoJz2IT",  // Consolidated LI Reply Notification
+]);
+
 // Cooldown to prevent repeated fix attempts
 const COOLDOWN_MS = 5 * 60 * 1000;
 
@@ -677,6 +687,52 @@ You can provide parameters, node_options, or both in a single call.`,
         }
       },
       required: ["workflow_id", "node_name"]
+    }
+  },
+  {
+    name: "patch_node_field",
+    description: `Surgically edit a string field on a node using find/replace.
+
+**PREFER THIS over update_node for any syntax/typo/string fix.** It only touches the specified substring — the rest of the field is preserved byte-for-byte.
+
+Strict semantics:
+- If \`find\` is not present in the field → ERROR (no silent no-op)
+- If \`find\` matches more than once AND \`replace_all\` is false → ERROR (ambiguity)
+- \`find\` and \`replace\` are each capped at 10KB to prevent wholesale rewrites
+
+Use cases: escape-character fixes (\\' in expressions), typos in URLs/field names, token rotation.
+Do NOT use when the fix requires restructuring a field (use update_node instead).`,
+    input_schema: {
+      type: "object",
+      properties: {
+        workflow_id: {
+          type: "string",
+          description: "The workflow ID containing the node"
+        },
+        node_name: {
+          type: "string",
+          description: "The exact name of the node to patch"
+        },
+        field_path: {
+          type: "string",
+          description: "Dot + bracket path to the target string field, e.g. \"parameters.text\" or \"parameters.headerParameters.parameters[0].value\""
+        },
+        patches: {
+          type: "array",
+          description: "Sequential find/replace patches to apply to the string field",
+          items: {
+            type: "object",
+            properties: {
+              find: { type: "string" },
+              replace: { type: "string" },
+              replace_all: { type: "boolean" },
+              regex: { type: "boolean" }
+            },
+            required: ["find", "replace"]
+          }
+        }
+      },
+      required: ["workflow_id", "node_name", "field_path", "patches"]
     }
   },
   {
@@ -1371,6 +1427,7 @@ async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions
     if (node.waitBetweenTries) clean.waitBetweenTries = node.waitBetweenTries;
     if (node.executeOnce) clean.executeOnce = node.executeOnce;
     if (node.alwaysOutputData) clean.alwaysOutputData = node.alwaysOutputData;
+    if (node.webhookId) clean.webhookId = node.webhookId;
     return clean;
   });
 
@@ -1387,6 +1444,14 @@ async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions
         cleanSettings[key] = workflow.settings[key];
       }
     }
+  }
+
+  // Version guard: re-read to detect concurrent edits before PUT
+  const reGetRes = await fetch(getUrl, { headers: { "X-N8N-API-KEY": N8N_API_KEY } });
+  if (!reGetRes.ok) throw new Error(`Failed to re-fetch workflow before PUT: ${reGetRes.status}`);
+  const freshWorkflow = await reGetRes.json();
+  if (freshWorkflow.updatedAt !== workflow.updatedAt) {
+    throw new Error(`CONCURRENT_EDIT_DETECTED: workflow updatedAt changed from ${workflow.updatedAt} to ${freshWorkflow.updatedAt}. Re-read the workflow and re-plan your fix against fresh state.`);
   }
 
   // Update the workflow
@@ -1412,6 +1477,160 @@ async function handleUpdateNode(workflowId, nodeName, newParameters, nodeOptions
   return {
     success: true,
     message: `Updated node "${nodeName}" in workflow "${workflow.name}"`
+  };
+}
+
+// =============================================================================
+// PATCH NODE FIELD (surgical string find/replace — prefer over update_node for syntax fixes)
+// =============================================================================
+
+async function handlePatchNodeField(workflowId, nodeName, fieldPath, patches) {
+  log(`Patching field "${fieldPath}" on node "${nodeName}" in workflow ${workflowId}...`);
+
+  if (!Array.isArray(patches) || patches.length === 0) {
+    throw new Error("patches must be a non-empty array of {find, replace} objects");
+  }
+
+  // Fetch + snapshot (same pattern as handleUpdateNode)
+  const getUrl = `${N8N_API_URL}/api/v1/workflows/${workflowId}`;
+  const getRes = await fetch(getUrl, { headers: { "X-N8N-API-KEY": N8N_API_KEY } });
+  if (!getRes.ok) throw new Error(`Failed to fetch workflow for patch: ${getRes.status}`);
+  const workflow = await getRes.json();
+  const preSnapshotUpdatedAt = workflow.updatedAt;
+
+  try {
+    const snapshotFile = path.join(SNAPSHOTS_DIR, `${workflowId}-${Date.now()}.json`);
+    fs.writeFileSync(snapshotFile, JSON.stringify(workflow, null, 2));
+    log(`Snapshot saved: ${snapshotFile}`);
+  } catch (err) {
+    log(`Warning: Failed to save snapshot: ${err.message}`);
+  }
+
+  // Validate patches (size cap to prevent wholesale rewrites disguised as patches)
+  for (const p of patches) {
+    if (typeof p.find !== "string" || typeof p.replace !== "string") {
+      throw new Error("patches[].find and patches[].replace must be strings");
+    }
+    if (p.find.length > 10000 || p.replace.length > 10000) {
+      throw new Error("patches[] find/replace are capped at 10KB each. For larger edits, use update_node with a minimal parameters object.");
+    }
+  }
+
+  // Locate target node
+  const targetNode = workflow.nodes.find(n => n.name === nodeName);
+  if (!targetNode) throw new Error(`Node "${nodeName}" not found in workflow`);
+
+  // Walk field_path — supports dot + bracket notation like parameters.headerParameters.parameters[0].value
+  const pathTokens = fieldPath
+    .replace(/\[(\d+)\]/g, ".$1")
+    .split(".")
+    .filter(Boolean);
+  if (pathTokens.length === 0) throw new Error("field_path must not be empty");
+
+  let cursor = targetNode;
+  for (let i = 0; i < pathTokens.length - 1; i++) {
+    const key = pathTokens[i];
+    if (cursor == null || typeof cursor !== "object") {
+      throw new Error(`field_path resolves to non-object at "${pathTokens.slice(0, i + 1).join(".")}"`);
+    }
+    cursor = cursor[key];
+  }
+  const leafKey = pathTokens[pathTokens.length - 1];
+  if (cursor == null || typeof cursor !== "object") {
+    throw new Error(`field_path parent is not an object`);
+  }
+  let current = cursor[leafKey];
+  if (typeof current !== "string") {
+    throw new Error(`field_path "${fieldPath}" does not resolve to a string (got ${typeof current}). Use update_node for non-string fields.`);
+  }
+
+  const beforePreview = current.slice(0, 120);
+
+  // Apply patches sequentially with strict ambiguity detection
+  for (const p of patches) {
+    const replaceAll = p.replace_all === true;
+    if (p.regex === true) {
+      const re = new RegExp(p.find, replaceAll ? "g" : "");
+      if (!re.test(current)) {
+        throw new Error(`Regex find not matched: /${p.find}/`);
+      }
+      current = current.replace(re, p.replace);
+    } else {
+      const parts = current.split(p.find);
+      const occurrences = parts.length - 1;
+      if (occurrences === 0) {
+        throw new Error(`find string not present: "${p.find.slice(0, 80)}${p.find.length > 80 ? "..." : ""}"`);
+      }
+      if (occurrences > 1 && !replaceAll) {
+        throw new Error(`find string matches ${occurrences} times; set replace_all=true or make the find string more specific`);
+      }
+      current = replaceAll ? parts.join(p.replace) : current.replace(p.find, p.replace);
+    }
+  }
+  cursor[leafKey] = current;
+
+  const afterPreview = current.slice(0, 120);
+
+  // Version guard: re-read to detect concurrent edits before PUT
+  const reGetRes = await fetch(getUrl, { headers: { "X-N8N-API-KEY": N8N_API_KEY } });
+  if (!reGetRes.ok) throw new Error(`Failed to re-fetch workflow before PUT: ${reGetRes.status}`);
+  const freshWorkflow = await reGetRes.json();
+  if (freshWorkflow.updatedAt !== preSnapshotUpdatedAt) {
+    throw new Error(`CONCURRENT_EDIT_DETECTED: workflow updatedAt changed from ${preSnapshotUpdatedAt} to ${freshWorkflow.updatedAt}. Re-read the workflow and re-plan your patch against fresh state.`);
+  }
+
+  // Clean nodes for PUT (same whitelist as handleUpdateNode, plus webhookId preservation)
+  const cleanNodes = workflow.nodes.map(node => {
+    const clean = {
+      id: node.id, name: node.name, type: node.type,
+      typeVersion: node.typeVersion, position: node.position,
+      parameters: node.parameters || {}
+    };
+    if (node.credentials) clean.credentials = node.credentials;
+    if (node.disabled) clean.disabled = node.disabled;
+    if (node.onError) clean.onError = node.onError;
+    if (node.continueOnFail) clean.continueOnFail = node.continueOnFail;
+    if (node.retryOnFail) clean.retryOnFail = node.retryOnFail;
+    if (node.maxTries) clean.maxTries = node.maxTries;
+    if (node.waitBetweenTries) clean.waitBetweenTries = node.waitBetweenTries;
+    if (node.executeOnce) clean.executeOnce = node.executeOnce;
+    if (node.alwaysOutputData) clean.alwaysOutputData = node.alwaysOutputData;
+    if (node.webhookId) clean.webhookId = node.webhookId;
+    return clean;
+  });
+  const cleanSettings = {};
+  const allowedSettings = [
+    "executionOrder", "timezone", "errorWorkflow",
+    "saveDataErrorExecution", "saveDataSuccessExecution",
+    "saveExecutionProgress", "saveManualExecutions", "executionTimeout"
+  ];
+  if (workflow.settings) {
+    for (const k of allowedSettings) {
+      if (workflow.settings[k] !== undefined) cleanSettings[k] = workflow.settings[k];
+    }
+  }
+
+  const updateRes = await fetch(getUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-N8N-API-KEY": N8N_API_KEY },
+    body: JSON.stringify({
+      name: workflow.name,
+      nodes: cleanNodes,
+      connections: workflow.connections,
+      settings: cleanSettings
+    })
+  });
+  if (!updateRes.ok) {
+    const text = await updateRes.text();
+    throw new Error(`Failed to update workflow: ${updateRes.status} - ${text}`);
+  }
+
+  return {
+    success: true,
+    message: `Patched field "${fieldPath}" on node "${nodeName}"`,
+    patches_applied: patches.length,
+    before_preview: beforePreview + (current !== beforePreview.slice(0, 120) ? "" : ""),
+    after_preview: afterPreview
   };
 }
 
@@ -1600,6 +1819,14 @@ async function executeTool(toolName, toolInput) {
           toolInput.node_options || null
         );
 
+      case "patch_node_field":
+        return await handlePatchNodeField(
+          toolInput.workflow_id,
+          toolInput.node_name,
+          toolInput.field_path,
+          toolInput.patches
+        );
+
       case "validate_workflow":
         return await handleValidateWorkflow(toolInput.workflow_id);
 
@@ -1632,6 +1859,13 @@ async function executeTool(toolName, toolInput) {
 
 async function runAgentLoop(errorData, recurrence = { isRecurring: false, attemptCount: 0, previousAttempts: [] }) {
   const timestamp = errorData.timestamp || new Date().toISOString();
+
+  // Force diagnose-only for revenue-critical workflows regardless of env setting
+  const forceDiagnoseOnly = FIX_EXCLUDED_WORKFLOWS.has(errorData.workflowId);
+  const effectiveDiagnoseOnly = DIAGNOSE_ONLY || forceDiagnoseOnly;
+  if (forceDiagnoseOnly) {
+    log(`Workflow ${errorData.workflowId} is in FIX_EXCLUDED_WORKFLOWS — forcing diagnose-only mode.`);
+  }
 
   // Build fix history context from persistent storage
   const history = fixHistory[errorData.workflowId] || [];
@@ -1714,11 +1948,11 @@ Start by fetching the execution details to get full context about the error.`
       body: JSON.stringify({
         model: CLAUDE_MODEL,
         max_tokens: 16384,
-        system: DIAGNOSE_ONLY
-          ? SYSTEM_PROMPT + `\n\n## DIAGNOSE-ONLY MODE (ACTIVE)\nYou are in DIAGNOSE-ONLY mode. Analyze the error and identify the root cause, but do NOT attempt to fix the workflow. Your job is to:\n1. Call get_execution_details to understand the error\n2. Call get_workflow and/or scan_workflow_for_pattern to investigate\n3. Send a Slack notification with: error summary, root cause analysis, and recommended fix steps for a human to apply\n4. Call complete() with your diagnosis summary\n\nDo NOT call update_node or rollback_workflow — those tools are not available in this mode.`
+        system: effectiveDiagnoseOnly
+          ? SYSTEM_PROMPT + `\n\n## DIAGNOSE-ONLY MODE (ACTIVE)${forceDiagnoseOnly ? " — WORKFLOW IS REVENUE-CRITICAL" : ""}\nYou are in DIAGNOSE-ONLY mode. Analyze the error and identify the root cause, but do NOT attempt to fix the workflow. Your job is to:\n1. Call get_execution_details to understand the error\n2. Call get_workflow and/or scan_workflow_for_pattern to investigate\n3. Send a Slack notification with: error summary, root cause analysis, and recommended fix steps for a human to apply\n4. Call complete() with your diagnosis summary\n\nDo NOT call update_node, patch_node_field, or rollback_workflow — those tools are not available in this mode.`
           : SYSTEM_PROMPT,
-        tools: DIAGNOSE_ONLY
-          ? TOOLS.filter(t => t.name !== 'update_node' && t.name !== 'rollback_workflow')
+        tools: effectiveDiagnoseOnly
+          ? TOOLS.filter(t => t.name !== 'update_node' && t.name !== 'patch_node_field' && t.name !== 'rollback_workflow')
           : TOOLS,
         messages: messages
       })
