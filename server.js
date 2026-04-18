@@ -2314,6 +2314,20 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       try {
         const errorData = JSON.parse(body);
+
+        const missing = [];
+        if (!errorData.workflowId) missing.push("workflowId");
+        if (!errorData.executionId) missing.push("executionId");
+        if (!errorData.errorMessage) missing.push("errorMessage");
+        if (missing.length) {
+          const srcIp = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown";
+          const ua = req.headers["user-agent"] || "unknown";
+          log(`Rejected /n8n-error (missing: ${missing.join(",")}) from ip=${srcIp} ua="${ua}" bodyLen=${body.length}`);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "missing required fields", missing }));
+          return;
+        }
+
         const executionId = errorData.executionId;
         log(`Received error for: ${errorData.workflowName || "unknown"} (exec: ${executionId})`);
 
